@@ -1,18 +1,20 @@
 import torch
-import os, shutil
-import math
 import torch.nn as nn
-from torch.utils.data import DataLoader
-from torchvision.utils import make_grid, save_image
+from PIL import ImageDraw
+from torchvision.utils import make_grid
 from torchvision.transforms.functional import to_pil_image
-import random
-import mlflow
-import os
-from tqdm import tqdm
-import mlflow.pytorch
-from datetime import datetime
-from utils.logger_utils import get_temp_logger
-from models.ode_solvers import euler_solver, create_samples, make_vf_cfg
+from models.ode_solvers import (
+    euler_solver,
+    sample_conditional,
+    sample_unconditional,
+)
+
+
+def _log(logger, message: str, *args) -> None:
+    if logger is not None:
+        logger.info(message, *args)
+    else:
+        print(message % args)
 
 
 def flow_matching_step(model, x1, loss_fn, device):
@@ -26,7 +28,7 @@ def flow_matching_step(model, x1, loss_fn, device):
     return mse
 
 
-def flow_matching_step_cfg(model, x1, y, p_drop, NULL_ID, loss_fn, device):
+def flow_matching_step_cfg(model, x1, y, p_drop, null_id, loss_fn, device):
     B = x1.shape[0]
     x1 = x1.to(device)
     y = y.to(device)
@@ -36,7 +38,7 @@ def flow_matching_step_cfg(model, x1, y, p_drop, NULL_ID, loss_fn, device):
 
     drop_mask = torch.rand_like(y.float()) < p_drop
     y_drop = y.clone()
-    y_drop[drop_mask] = NULL_ID
+    y_drop[drop_mask] = null_id
 
     v_est = model((1 - t) * x0 + x1 * t, t, y_drop)
     v_true = x1 - x0
@@ -44,100 +46,41 @@ def flow_matching_step_cfg(model, x1, y, p_drop, NULL_ID, loss_fn, device):
     return mse
 
 
-def create_pil_image(images: torch.Tensor, nrow: int = 8):
+def create_pil_image(
+    images: torch.Tensor,
+    nrow: int = 8,
+    labels: torch.Tensor | list[int] | None = None,
+):
     images = images.detach().cpu()
     if images.min() < 0:
         images = (images + 1) / 2
     images = images.clamp(0, 1)
 
-    grid = make_grid(images, nrow=nrow)
-    # Create PIL image
+    padding = 2
+    grid = make_grid(images, nrow=nrow, padding=padding)
     img = to_pil_image(grid)
+    if labels is not None:
+        labels_list = (
+            labels.detach().cpu().tolist()
+            if isinstance(labels, torch.Tensor)
+            else labels
+        )
+        draw = ImageDraw.Draw(img)
+        tile_h = int(images.shape[-2])
+        tile_w = int(images.shape[-1])
+        text_fill = (255, 255, 255) if img.mode in ("RGB", "RGBA") else 255
+        bg_fill = (0, 0, 0) if img.mode in ("RGB", "RGBA") else 0
+        for idx, label in enumerate(labels_list):
+            row = idx // nrow
+            col = idx % nrow
+            x = padding + col * (tile_w + padding) + 1
+            y = padding + row * (tile_h + padding) + 1
+            text = str(label)
+            x1, y1, x2, y2 = draw.textbbox((x, y), text)
+            draw.rectangle((x1 - 1, y1 - 1, x2 + 1, y2 + 1), fill=bg_fill)
+            draw.text((x, y), text, fill=text_fill)
 
     return img
-
-
-# Needs refactoring
-# def train_loop_uncond(
-#     model,
-#     dataloader: DataLoader,
-#     num_epochs: int = 10,
-#     lr: float = 1e-3,
-#     log_every_step: int = 100,
-#     log_every_epoch: int = 10,
-#     sample_steps:int = 50,
-#     run_name_prefix: str = 'FM-MNIST-Uncond',
-#     device: str = 'cuda',
-
-#     sample_grid_size = 8,
-#     ode_solver = euler_solver,
-#     ode_steps = 50):
-
-#     mlflow.set_experiment("Flow Matching MNIST Unconditional")
-#     logger, log_path = get_temp_logger("train_uncond")
-#     run_name = run_name_prefix + datetime.now().strftime("-%Y-%m-%d_%H-%M-%S")
-#     optim = torch.optim.AdamW(model.parameters(), lr=lr)
-#     loss_fn = nn.MSELoss()
-#     images, _ = next(iter(dataloader))
-#     BATCH_SIZE, *IMAGE_SHAPE = images.shape
-#     IMAGE_SHAPE = tuple(IMAGE_SHAPE)
-#     params = {
-#             "lr":lr,
-#             "epochs": num_epochs,
-#             "samples_steps": sample_steps,
-#             "model_params": sum(p.numel() for p in model.parameters()),
-#             "batch_size": BATCH_SIZE,
-#             "ode_steps": ode_steps,
-#             "ode_solver": getattr(ode_solver, "__name__", str(ode_solver)),
-#             "image_shape": IMAGE_SHAPE
-#         }
-#     with mlflow.start_run(run_name = run_name) as run:
-#         logger.info("Starting unconditional training")
-#         mlflow.log_params(params)
-#         logger.info("Hyperparameters:\n" + "\n".join(f" {k}: {v}" for k, v in params.items()))
-#         global_step = 0
-#         for epoch in tqdm(range(num_epochs)):
-#             model.train()
-#             running_loss = 0.0
-#             # Loop over dataset
-#             for i,(x1,_) in enumerate(dataloader):
-#                 optim.zero_grad()
-#                 # Generate esstimated velociy fields and compute MSE
-#                 mse = flow_matching_step(model,x1,loss_fn,device)
-#                 mse.backward()
-#                 optim.step()
-#                 running_loss += mse.item()
-
-#                 if global_step % log_every_step == 0:
-#                     mlflow.log_metric("mse_step", mse.item(), step = global_step)
-#                     logger.info(f"[epoch {epoch:03d} | step {global_step:06d}] mse={mse.item() :.6f}")
-#                 global_step += 1
-#             # Sample batch of images
-#             if epoch % log_every_epoch == 0:
-#                 mlflow.log_metric("mse_epoch", running_loss / len(dataloader), step = epoch)
-#                 # Create callback for velocity field
-#                 f = make_vf_uncond(model)
-#                 logger.info(f"[epoch {epoch:03d} | step {global_step:06d}] Creating sample images")
-#                 samples = create_samples(BATCH_SIZE, IMAGE_SHAPE, ode_solver, f, n_steps = ode_steps, seed = 0, device=device)
-#                 img = create_pil_image(samples)
-#                 logger.info(f"[epoch {epoch:03d} | step {global_step:06d}] Saving sample images")
-#                 mlflow.log_image(img,key="train_generated_samples", step = epoch)
-
-
-#         f = make_vf_uncond(model)
-#         samples = create_samples(BATCH_SIZE, IMAGE_SHAPE, ode_solver, f, n_steps = ode_steps, return_all=True, seed = 0,device=device)
-#         for i,x in enumerate(samples):
-#             img = create_pil_image(x,nrow=sample_grid_size)
-#             mlflow.log_image(img,key="final_generated_samples", step = i)
-#         logger.info("Saving model artifact")
-#         model_info = mlflow.pytorch.log_model(
-#             model,
-#             name = 'UNet'
-#         )
-#         mlflow.log_artifact(log_path, artifact_path="logs")
-#         tmpdir = os.path.dirname(log_path)
-#         shutil.rmtree(tmpdir, ignore_errors=True)
-#     return model_info
 
 
 def train_loop_uncond(
@@ -149,6 +92,15 @@ def train_loop_uncond(
     val_loader=None,
     on_step=None,
     on_epoch=None,
+    sample_every_epochs: int | None = None,
+    sample_n_images: int | None = None,
+    sample_image_shape=None,
+    sample_ode_solver=euler_solver,
+    sample_ode_steps: int = 50,
+    sample_seed: int | None = 0,
+    on_sample=None,
+    logger=None,
+    log_every_steps: int = 100,
 ):
     """
     on_step(global_step, train_mse_step, epoch)
@@ -162,6 +114,15 @@ def train_loop_uncond(
     global_step = 0
     best_train = float("inf")
     best_val = float("inf")
+
+    _log(
+        logger,
+        "train_loop_uncond: epochs=%d device=%s sample_every_epochs=%s sample_ode_steps=%d",
+        num_epochs,
+        str(device),
+        str(sample_every_epochs),
+        sample_ode_steps,
+    )
 
     for epoch in range(num_epochs):
         # train
@@ -179,6 +140,14 @@ def train_loop_uncond(
 
             if on_step is not None:
                 on_step(global_step, mse_step, epoch)
+            if global_step % log_every_steps == 0:
+                _log(
+                    logger,
+                    "[epoch %03d | step %06d] train_mse_step=%.6f",
+                    epoch,
+                    global_step,
+                    mse_step,
+                )
 
             global_step += 1
 
@@ -199,150 +168,205 @@ def train_loop_uncond(
 
         if on_epoch is not None:
             on_epoch(epoch, train_mse_epoch, val_mse_epoch)
+        if val_mse_epoch is None:
+            _log(
+                logger,
+                "[epoch %03d] train_mse_epoch=%.6f",
+                epoch,
+                train_mse_epoch,
+            )
+        else:
+            _log(
+                logger,
+                "[epoch %03d] train_mse_epoch=%.6f val_mse_epoch=%.6f",
+                epoch,
+                train_mse_epoch,
+                val_mse_epoch,
+            )
+
+        if sample_every_epochs is not None and sample_every_epochs > 0:
+            should_sample = (epoch + 1) % sample_every_epochs == 0
+            if should_sample:
+                if sample_n_images is None or sample_image_shape is None:
+                    raise ValueError(
+                        "sample_n_images and sample_image_shape must be set when sample_every_epochs is enabled."
+                    )
+                samples = sample_unconditional(
+                    model=model,
+                    n_images=sample_n_images,
+                    image_shape=sample_image_shape,
+                    ode_solver=sample_ode_solver,
+                    n_steps=sample_ode_steps,
+                    return_all=False,
+                    device=device,
+                    seed=sample_seed,
+                )
+                if on_sample is not None:
+                    on_sample(epoch, samples)
+                _log(
+                    logger,
+                    "[epoch %03d] logged unconditional sample grid (n_images=%d, ode_steps=%d)",
+                    epoch,
+                    sample_n_images,
+                    sample_ode_steps,
+                )
 
     return best_val if val_loader is not None else best_train
 
 
-# TODO:
-# def train_uncond_hpt(trial):
-#     cfg = sample_cfg(trial)
-
-#     mlflow.set_experiment("hpt/cond_unet")
-#     with mlflow.start_run(run_name=f"trial_{trial.number:04d}"):
-#         mlflow.log_params(cfg)
-#         mlflow.set_tag("optuna_trial", trial.number)
-
-#         def on_epoch(epoch, val_loss):
-#             mlflow.log_metric("val_loss", float(val_loss), step=epoch)
-#             trial.report(val_loss, step=epoch)
-#             if trial.should_prune():
-#                 raise optuna.TrialPruned()
-
-#         best = train_loop_uncond(
-#             model=build_model(cfg),
-#             dataloader=train_loader,
-#             num_epochs=cfg["hpt_epochs"],   # small budget
-#             on_epoch=on_epoch,
-#         )
-
-#         mlflow.log_metric("best_val_loss", float(best))
-#         return float(best)
-
-
-# TODO: refactor
-def train_loop_cfg(
+def train_loop_class_cond(
     model,
-    dataloader: DataLoader,
-    NULL_ID,
+    train_loader,
+    num_epochs: int,
+    optim,
+    device,
+    null_id: int,
     p_drop: float = 0.2,
-    w=1,
-    num_epochs: int = 10,
-    lr: float = 1e-3,
-    log_every_step: int = 1,
-    log_every_epoch: int = 10,
-    sample_steps: int = 50,
-    experiment_name: str = "mnist-fm-cond-unet",
-    run_name: str = None,
-    device: str = "cuda",
-    sample_grid_size=8,
-    ode_solver=euler_solver,
-    ode_steps=50,
-    save_model=True,
+    val_loader=None,
+    on_step=None,
+    on_epoch=None,
+    sample_every_epochs=None,
+    sample_n_rows=None,
+    sample_classes=None,
+    sample_image_shape=None,
+    sample_ode_solver=euler_solver,
+    sample_ode_steps=None,
+    sample_guidance_scale=1.0,
+    sample_seed=None,
+    on_sample=None,
+    logger=None,
+    log_every_steps: int = 100,
 ):
-    mlflow.set_experiment(experiment_name)
-    optim = torch.optim.AdamW(model.parameters(), lr=lr)
+    """
+    on_step(global_step, train_mse_step, epoch)
+    on_epoch(epoch, train_mse_epoch, val_mse_epoch)
+        - val_mse_epoch is None if val_loader is None
+    Returns:
+        best_val_mse if val_loader is provided, else best_train_mse
+    """
     loss_fn = nn.MSELoss()
-    images, labels = next(iter(dataloader))
-    BATCH_SIZE, *IMAGE_SHAPE = images.shape
-    IMAGE_SHAPE = tuple(IMAGE_SHAPE)
-    input_example = {
-        "x": torch.randn(1, *IMAGE_SHAPE).cpu().numpy(),
-        "t": torch.zeros(1, 1, 1, 1).cpu().numpy(),
-        "y": torch.tensor([0], dtype=labels.dtype).cpu().numpy(),
-    }
 
-    run_name = f"{run_name if run_name else experiment_name + '_' + datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
-    logger, log_path = get_temp_logger("train_cfg")
-    with mlflow.start_run(run_name=run_name) as run:
-        mlflow.log_params(
-            {
-                "lr": lr,
-                "epochs": num_epochs,
-                "cfg_strength": w,
-                "p_drop": p_drop,
-                "NULL_ID": NULL_ID,
-                "samples_steps": sample_steps,
-                "model_params": sum(p.numel() for p in model.parameters()),
-                "batch_size": BATCH_SIZE,
-                "ode_steps": ode_steps,
-                "ode_solver": getattr(ode_solver, "__name__", str(ode_solver)),
-            }
-        )
-        conditional_sampling_grid_labels = (
-            torch.tensor([i for i in range(NULL_ID)])
-            .repeat(sample_grid_size, 1)
-            .flatten()
-        )
-        global_step = 0
-        for epoch in tqdm(range(num_epochs)):
-            model.train()
-            running_loss = 0.0
-            for i, (x1, c) in enumerate(dataloader):
-                optim.zero_grad()
-                mse = flow_matching_step_cfg(
-                    model, x1, c, p_drop, NULL_ID, loss_fn, device
+    global_step = 0
+    best_train = float("inf")
+    best_val = float("inf")
+
+    _log(
+        logger,
+        "train_loop_class_cond: epochs=%d device=%s p_drop=%.3f null_id=%d guidance_scale=%.3f",
+        num_epochs,
+        str(device),
+        p_drop,
+        null_id,
+        sample_guidance_scale,
+    )
+
+    for epoch in range(num_epochs):
+        model.train()
+        running = 0.0
+
+        for x1, y in train_loader:
+            optim.zero_grad(set_to_none=True)
+            mse = flow_matching_step_cfg(
+                model=model,
+                x1=x1,
+                y=y,
+                p_drop=p_drop,
+                null_id=null_id,
+                loss_fn=loss_fn,
+                device=device,
+            )
+            mse.backward()
+            optim.step()
+
+            mse_step = float(mse.item())
+            running += mse_step
+
+            if on_step is not None:
+                on_step(global_step, mse_step, epoch)
+            if global_step % log_every_steps == 0:
+                _log(
+                    logger,
+                    "[epoch %03d | step %06d] train_mse_step=%.6f",
+                    epoch,
+                    global_step,
+                    mse_step,
                 )
-                mse.backward()
-                optim.step()
-                running_loss += mse.item()
+            global_step += 1
 
-                if global_step % log_every_step == 0:
-                    mlflow.log_metric("mse_step", mse.item(), step=global_step)
-                global_step += 1
+        train_mse_epoch = running / len(train_loader)
+        best_train = min(best_train, train_mse_epoch)
 
-            if epoch % log_every_epoch == 0:
-                f = make_vf_cfg(model, conditional_sampling_grid_labels, w, num_epochs)
-                mlflow.log_metric(
-                    "mse_epoch", running_loss / len(dataloader), step=epoch
-                )
-                samples = create_samples(
-                    NULL_ID * sample_grid_size,
-                    IMAGE_SHAPE,
-                    ode_solver,
-                    f,
-                    n_steps=ode_steps,
-                    seed=0,
+        val_mse_epoch = None
+        if val_loader is not None:
+            model.eval()
+            v_running = 0.0
+            with torch.no_grad():
+                for x1, y in val_loader:
+                    mse = flow_matching_step_cfg(
+                        model=model,
+                        x1=x1,
+                        y=y,
+                        p_drop=0.0,
+                        null_id=null_id,
+                        loss_fn=loss_fn,
+                        device=device,
+                    )
+                    v_running += float(mse.item())
+            val_mse_epoch = v_running / len(val_loader)
+            best_val = min(best_val, val_mse_epoch)
+
+        if on_epoch is not None:
+            on_epoch(epoch, train_mse_epoch, val_mse_epoch)
+        if val_mse_epoch is None:
+            _log(
+                logger,
+                "[epoch %03d] train_mse_epoch=%.6f",
+                epoch,
+                train_mse_epoch,
+            )
+        else:
+            _log(
+                logger,
+                "[epoch %03d] train_mse_epoch=%.6f val_mse_epoch=%.6f",
+                epoch,
+                train_mse_epoch,
+                val_mse_epoch,
+            )
+
+        if sample_every_epochs is not None and sample_every_epochs > 0:
+            should_sample = (epoch + 1) % sample_every_epochs == 0
+            if should_sample:
+                if (
+                    sample_classes is None
+                    or sample_n_rows is None
+                    or sample_image_shape is None
+                ):
+                    raise ValƒcƒueError(
+                        "sample_classes, sample_n_rows and sample_image_shape must be set when sample_every_epochs is enabled."
+                    )
+                sample_steps = 50 if sample_ode_steps is None else sample_ode_steps
+                samples = sample_conditional(
+                    model=model,
+                    y=torch.arange(0, sample_classes).repeat(sample_n_rows),
+                    image_shape=sample_image_shape,
+                    ode_solver=sample_ode_solver,
+                    n_steps=sample_steps,
+                    guidance_scale=sample_guidance_scale,
+                    null_id=null_id,
+                    return_all=False,
                     device=device,
+                    seed=sample_seed,
                 )
-                img = create_pil_image(samples)
-                mlflow.log_image(
-                    img, artifact_file=f"train_grids/samples_epoch_{epoch:04d}.png"
+                if on_sample is not None:
+                    on_sample(epoch, samples)
+                _log(
+                    logger,
+                    "[epoch %03d] logged conditional sample grid (classes=%d, rows=%d, ode_steps=%d, guidance_scale=%.3f)",
+                    epoch,
+                    sample_classes,
+                    sample_n_rows,
+                    sample_steps,
+                    sample_guidance_scale,
                 )
 
-        f = make_vf_cfg(model, conditional_sampling_grid_labels, w, num_epochs)
-        samples = create_samples(
-            NULL_ID * sample_grid_size,
-            IMAGE_SHAPE,
-            ode_solver,
-            f,
-            n_steps=ode_steps,
-            return_all=True,
-            seed=0,
-            device=device,
-        )
-        for i, x in enumerate(samples):
-            img = create_pil_image(x, nrow=sample_grid_size)
-            mlflow.log_image(
-                img, artifact_file=f"final_grids/final_sample_ode_step_{i}.png"
-            )
-
-        model_info = None
-        if save_model:
-            model_info = mlflow.pytorch.log_model(
-                model,
-                artifact_path="models",
-            )
-        mlflow.log_artifact(log_path, artifact_path="logs")
-        tmpdir = os.path.dirname(log_path)
-        shutil.rmtree(tmpdir, ignore_errors=True)
-    return model_info
+    return best_val if val_loader is not None else best_train

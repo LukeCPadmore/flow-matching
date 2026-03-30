@@ -1,46 +1,198 @@
-import torchvision
-import math
+import argparse
+from datetime import datetime
+import os
+import shutil
+
+import mlflow
+import mlflow.pytorch
 import torch
-import matplotlib.pyplot as plt 
-import torch.nn as nn 
-import torchvision.transforms as transforms
-from torch.utils.data import DataLoader
-import os, sys
-from utils.train import train_loop_cfg
-from models.unet import UNet, CondUNet
-from models.ode_solvers import euler_solver, rk2_solver
-from pathlib import Path 
-PROJECT_ROOT = Path.cwd().parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
 
-batch_size = 64
-transform = transforms.Compose(
-    [transforms.ToTensor(),
-    transforms.Pad(2,padding_mode='constant'),
-    transforms.Normalize((0.5,), (0.5,))]
-)
-trainset = torchvision.datasets.MNIST(root = '/home/luke-padmore/Source/flow-matching-mnist/data',
-                                      train=True,
-                                      download=True,
-                                      transform=transform)
-trainloader = DataLoader(trainset,
-                        batch_size=batch_size,
-                        shuffle=True,
-                        num_workers=4)
+from models.config import OptimConfig, UNetConfig
+from models.unet import ClassCondUNet, UNet
+from utils.create_dataloaders import create_mnist_train_val_loaders
+from utils.logger_utils import get_temp_logger
+from utils.train import train_loop_class_cond, create_pil_image
 
-testset = torchvision.datasets.MNIST(root = '/home/luke-padmore/Source/flow-matching-mnist/data',
-                                      train=False,
-                                      download=True,
-                                      transform=transform)
-testloader = DataLoader(trainset,
-                        batch_size=batch_size,
-                        shuffle=True,
-                        num_workers=4)
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Train class-conditional FM UNet on MNIST."
+    )
+    parser.add_argument("--experiment-name", default="Flow Matching MNIST Conditional")
+    parser.add_argument("--run-name", default=None)
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument(
+        "--data-path",
+        default="/home/luke-padmore/Source/flow-matching-mnist/data",
+    )
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--log-every-steps", type=int, default=20)
+
+    parser.add_argument("--base-channels", type=int, default=32)
+    parser.add_argument("--n-layers", type=int, default=3)
+    parser.add_argument("--mult", type=float, default=2.0)
+    parser.add_argument("--d-trunk", type=int, default=8)
+    parser.add_argument("--d-concat", type=int, default=8)
+    parser.add_argument("--group-norm-size", type=int, default=8)
+    parser.add_argument("--d-time", type=int, default=128)
+    parser.add_argument("--max-time-period", type=float, default=10000.0)
+    parser.add_argument(
+        "--activation-name", default="silu", choices=["relu", "silu", "gelu"]
+    )
+    parser.add_argument(
+        "--upsample-mode",
+        default="nearest",
+        choices=["nearest", "bilinear", "convtranspose"],
+    )
+
+    parser.add_argument("--d-cls-emb", type=int, default=128)
+    parser.add_argument("--n-classes", type=int, default=10)
+    parser.add_argument(
+        "--null-id",
+        type=int,
+        default=None,
+        help="Defaults to n_classes when omitted",
+    )
+    parser.add_argument("--p-drop", type=float, default=0.2)
+
+    parser.add_argument(
+        "--optim-name", default="adamw", choices=["adam", "adamw", "sgd"]
+    )
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument("--sample-every-epochs", type=int, default=5)
+    parser.add_argument("--sample-ode-steps", type=int, default=50)
+    parser.add_argument(
+        "--sample-grid-nrows",
+        type=int,
+        default=10,
+        help="Rows in conditional sample grid",
+    )
+    parser.add_argument("--sample-seed", type=int, default=0)
+    parser.add_argument("--sample-guidance-scale", type=float, default=1)
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    unet_cfg = UNetConfig(
+        in_channels=1,
+        base_channels=args.base_channels,
+        mult=args.mult,
+        n_layers=args.n_layers,
+        d_trunk=args.d_trunk,
+        d_concat=args.d_concat,
+        group_norm_size=args.group_norm_size,
+        d_time=args.d_time,
+        max_time_period=args.max_time_period,
+        activation_name=args.activation_name,
+        upsample_mode=args.upsample_mode,
+    )
+    optim_cfg = OptimConfig(
+        name=args.optim_name, lr=args.lr, weight_decay=args.weight_decay
+    )
+
+    train_loader, val_loader = create_mnist_train_val_loaders(
+        batch_size=args.batch_size,
+        data_path=args.data_path,
+        num_workers=args.num_workers,
+        shuffle=True,
+        transform="default",
+    )
+
+    images, _ = next(iter(train_loader))
+    image_shape = tuple(images.shape[1:])
+
+    core = UNet.from_config(unet_cfg).to(device)
+    null_id = args.null_id if args.null_id is not None else args.n_classes
+    class_vocab_size = null_id + 1
+    model = ClassCondUNet(
+        core=core,
+        n_classes=class_vocab_size,
+        d_cls_emb=args.d_cls_emb,
+    ).to(device)
+    optim = optim_cfg.make_optimizer(model.parameters())
+
+    mlflow.set_experiment(args.experiment_name)
+    run_name = (
+        args.run_name or f"train_cond_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+    )
+    logger, log_path = get_temp_logger("train_cond")
+    with mlflow.start_run(run_name=run_name):
+        mlflow.log_params(unet_cfg.to_mlflow_params(prefix="unet"))
+        mlflow.log_params(optim_cfg.to_mlflow_params(prefix="optim"))
+        mlflow.log_param("unet.channels", ",".join(map(str, unet_cfg.channels)))
+        mlflow.log_param("epochs", args.epochs)
+        mlflow.log_param("batch_size", args.batch_size)
+        mlflow.log_param("num_workers", args.num_workers)
+        mlflow.log_param("device", str(device))
+        mlflow.log_param("p_drop", args.p_drop)
+        mlflow.log_param("n_classes", args.n_classes)
+        mlflow.log_param("class_vocab_size", class_vocab_size)
+        mlflow.log_param("null_id", null_id)
+        mlflow.log_param("d_cls_emb", args.d_cls_emb)
+        logger.info("Starting class-conditional training run '%s'", run_name)
+        logger.info("Device: %s", device)
+        logger.info(
+            "n_classes=%d class_vocab_size=%d null_id=%d",
+            args.n_classes,
+            class_vocab_size,
+            null_id,
+        )
+
+        def on_step(global_step: int, mse_step: float, _epoch: int) -> None:
+            if global_step % args.log_every_steps == 0:
+                mlflow.log_metric("train_mse_step", float(mse_step), step=global_step)
+
+        def on_epoch(epoch: int, train_mse: float, val_mse: float | None) -> None:
+            mlflow.log_metric("train_mse_epoch", float(train_mse), step=epoch)
+            if val_mse is not None:
+                mlflow.log_metric("val_mse_epoch", float(val_mse), step=epoch)
+
+        def on_sample(epoch: int, samples: torch.Tensor) -> None:
+            labels = torch.arange(args.n_classes).repeat(args.sample_grid_nrows)
+            img = create_pil_image(
+                samples,
+                nrow=args.sample_grid_nrows,
+                labels=labels,
+            )
+            mlflow.log_image(
+                img,
+                artifact_file=f"train_grids/cond_samples_epoch_{epoch:04d}.png",
+            )
+
+        best = train_loop_class_cond(
+            model=model,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            num_epochs=args.epochs,
+            optim=optim,
+            device=device,
+            null_id=null_id,
+            p_drop=args.p_drop,
+            on_step=on_step,
+            on_epoch=on_epoch,
+            sample_every_epochs=args.sample_every_epochs,
+            sample_n_rows=args.sample_grid_nrows,
+            sample_classes=args.n_classes,
+            sample_image_shape=image_shape,
+            sample_ode_steps=args.sample_ode_steps,
+            sample_guidance_scale=args.sample_guidance_scale,
+            sample_seed=args.sample_seed,
+            on_sample=on_sample,
+            logger=logger,
+            log_every_steps=args.log_every_steps,
+        )
+
+        mlflow.log_metric("best_mse", float(best))
+        mlflow.pytorch.log_model(model, name="ClassCondUNet")
+        logger.info("Finished class-conditional training. best_mse=%.6f", float(best))
+        mlflow.log_artifact(log_path, artifact_path="logs")
+    shutil.rmtree(os.path.dirname(log_path), ignore_errors=True)
 
 
 if __name__ == "__main__":
-    
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    model = CondUNet([1,32,64,128],11,8,8,8,128).to(device).to(device)
-    train_loop_cfg(model,trainloader,NULL_ID = 10,num_epochs=100)
+    main()

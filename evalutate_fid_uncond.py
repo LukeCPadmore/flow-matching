@@ -8,7 +8,7 @@ import json
 
 from utils.mlflow_tracking_utils import get_run_param, parse_int_list
 from utils.FID.fid_evaluation import evaluate_fid_with_registered_backbone
-from models.ode_solvers import get_ode_solver_from_name, make_vf_uncond, create_samples
+from models.ode_solvers import get_ode_solver_from_name, sample_unconditional
 
 def run_eval(
     generator_run_id: str,
@@ -35,7 +35,6 @@ def run_eval(
     if ode_solver_name is None:
         ode_solver_name = get_run_param(generator_run_id, "ode_solver")
     ode_solver = get_ode_solver_from_name(ode_solver_name)
-    f = make_vf_uncond(generator)
     if image_shape is None:
         image_shape = parse_int_list(get_run_param(generator_run_id, "image_shape"))
     else:
@@ -47,10 +46,10 @@ def run_eval(
 
 
     sample_fn = partial(
-        create_samples,
-        image_shape= image_shape,
-        ode_solver = ode_solver,
-        f=f,
+        sample_unconditional,
+        model=generator,
+        image_shape=image_shape,
+        ode_solver=ode_solver,
         n_steps=ode_steps,
         seed=None,
         device=device,
