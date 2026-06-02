@@ -6,3 +6,5 @@ mlflow.db
 optuna.db
 .env
 .venv/*
+mlartifacts/*
+checkpoints/*

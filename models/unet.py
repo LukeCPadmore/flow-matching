@@ -61,6 +61,13 @@ class SimpleClassConditioning(nn.Module):
     def forward(self, cls_idx):
         cls_embedding = self.cond_emb(cls_idx)
         return self.mlp(cls_embedding)
+    
+class GreyScaleEncoder(nn.Module):
+    def __init__(self):
+        pass
+    
+    def forward(self):
+        pass
 
 
 def conv_gn_act(

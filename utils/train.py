@@ -50,9 +50,15 @@ def create_pil_image(
     images: torch.Tensor,
     nrow: int = 8,
     labels: torch.Tensor | list[int] | None = None,
+    mean: tuple[float, ...] | None = None,
+    std: tuple[float, ...] | None = None,
 ):
     images = images.detach().cpu()
-    if images.min() < 0:
+    if mean is not None and std is not None:
+        mean_t = torch.tensor(mean, dtype=images.dtype).view(1, -1, 1, 1)
+        std_t = torch.tensor(std, dtype=images.dtype).view(1, -1, 1, 1)
+        images = images * std_t + mean_t
+    elif images.min() < 0:
         images = (images + 1) / 2
     images = images.clamp(0, 1)
 

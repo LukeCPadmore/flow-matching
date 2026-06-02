@@ -9,30 +9,39 @@ import torch
 
 from models.config import OptimConfig, UNetConfig
 from models.unet import ClassCondUNet, UNet
-from utils.create_dataloaders import create_mnist_train_val_loaders
+from utils.create_dataloaders import create_cifar10_train_val_loaders
 from utils.logger_utils import get_temp_logger
-from utils.train import train_loop_class_cond, create_pil_image
+from utils.train import create_pil_image, train_loop_class_cond
+
+CIFAR10_MEAN = (0.4914, 0.4822, 0.4465)
+CIFAR10_STD = (0.2470, 0.2435, 0.2616)
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Train class-conditional FM UNet on MNIST."
+        description="Train class-conditional FM UNet on CIFAR-10."
     )
-    parser.add_argument("--experiment-name", default="Flow Matching MNIST Conditional")
+    parser.add_argument("--experiment-name", default="Flow Matching CIFAR10 Conditional")
     parser.add_argument("--run-name", default=None)
-    parser.add_argument("--epochs", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=128)
     parser.add_argument(
         "--data-path",
         default="/home/luke-padmore/Source/flow-matching-mnist/data",
     )
-    parser.add_argument("--num-workers", type=int, default=0)
-    parser.add_argument("--log-every-steps", type=int, default=20)
+    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--log-every-steps", type=int, default=50)
+    parser.add_argument(
+        "--data-transform",
+        default="default",
+        choices=["default", "none"],
+        help="CIFAR-10 transform preset",
+    )
 
-    parser.add_argument("--base-channels", type=int, default=32)
+    parser.add_argument("--base-channels", type=int, default=64)
     parser.add_argument("--n-layers", type=int, default=3)
     parser.add_argument("--mult", type=float, default=2.0)
-    parser.add_argument("--d-trunk", type=int, default=8)
+    parser.add_argument("--d-trunk", type=int, default=32)
     parser.add_argument("--d-concat", type=int, default=8)
     parser.add_argument("--group-norm-size", type=int, default=8)
     parser.add_argument("--d-time", type=int, default=128)
@@ -59,8 +68,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--optim-name", default="adamw", choices=["adam", "adamw", "sgd"]
     )
-    parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--weight-decay", type=float, default=1e-2)
+    parser.add_argument("--lr", type=float, default=3e-4)
+    parser.add_argument("--weight-decay", type=float, default=1e-4)
     parser.add_argument("--sample-every-epochs", type=int, default=5)
     parser.add_argument("--sample-ode-steps", type=int, default=50)
     parser.add_argument(
@@ -70,7 +79,7 @@ def parse_args() -> argparse.Namespace:
         help="Rows in conditional sample grid",
     )
     parser.add_argument("--sample-seed", type=int, default=0)
-    parser.add_argument("--sample-guidance-scale", type=float, default=1)
+    parser.add_argument("--sample-guidance-scale", type=float, default=1.0)
     parser.add_argument(
         "--checkpoint-dir",
         default="checkpoints",
@@ -96,7 +105,7 @@ def main() -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     unet_cfg = UNetConfig(
-        in_channels=1,
+        in_channels=3,
         base_channels=args.base_channels,
         mult=args.mult,
         n_layers=args.n_layers,
@@ -112,12 +121,12 @@ def main() -> None:
         name=args.optim_name, lr=args.lr, weight_decay=args.weight_decay
     )
 
-    train_loader, val_loader = create_mnist_train_val_loaders(
+    train_loader, val_loader = create_cifar10_train_val_loaders(
         batch_size=args.batch_size,
         data_path=args.data_path,
         num_workers=args.num_workers,
         shuffle=True,
-        transform="default",
+        transform=args.data_transform,
     )
 
     images, _ = next(iter(train_loader))
@@ -137,9 +146,10 @@ def main() -> None:
 
     mlflow.set_experiment(args.experiment_name)
     run_name = (
-        args.run_name or f"train_cond_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
+        args.run_name
+        or f"train_cond_cifar10_{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     )
-    logger, log_path = get_temp_logger("train_cond")
+    logger, log_path = get_temp_logger("train_cond_cifar10")
     checkpoint_dir = os.path.join(args.checkpoint_dir, run_name)
     os.makedirs(checkpoint_dir, exist_ok=True)
     mlflow.enable_system_metrics_logging()
@@ -147,6 +157,8 @@ def main() -> None:
     with mlflow.start_run(run_name=run_name):
         mlflow.log_params(unet_cfg.to_mlflow_params(prefix="unet"))
         mlflow.log_params(optim_cfg.to_mlflow_params(prefix="optim"))
+        mlflow.log_param("dataset", "cifar10")
+        mlflow.log_param("data_transform", args.data_transform)
         mlflow.log_param("unet.channels", ",".join(map(str, unet_cfg.channels)))
         mlflow.log_param("epochs", args.epochs)
         mlflow.log_param("batch_size", args.batch_size)
@@ -160,7 +172,7 @@ def main() -> None:
         mlflow.log_param("checkpoint_dir", checkpoint_dir)
         mlflow.log_param("checkpoint_every_epochs", args.checkpoint_every_epochs)
         mlflow.log_param("system_metrics_interval_s", args.system_metrics_interval_s)
-        logger.info("Starting class-conditional training run '%s'", run_name)
+        logger.info("Starting class-conditional CIFAR-10 training run '%s'", run_name)
         logger.info("Device: %s", device)
         logger.info(
             "n_classes=%d class_vocab_size=%d null_id=%d",
@@ -226,10 +238,12 @@ def main() -> None:
                 samples,
                 nrow=args.sample_grid_nrows,
                 labels=labels,
+                mean=CIFAR10_MEAN if args.data_transform == "default" else None,
+                std=CIFAR10_STD if args.data_transform == "default" else None,
             )
             mlflow.log_image(
                 img,
-                artifact_file=f"train_grids/cond_samples_epoch_{epoch:04d}.png",
+                artifact_file=f"train_grids/cifar10_cond_samples_epoch_{epoch:04d}.png",
             )
 
         best = train_loop_class_cond(
@@ -259,7 +273,9 @@ def main() -> None:
         if last_epoch >= 0:
             save_checkpoint("final.pt", last_epoch, last_train_mse, last_val_mse)
         mlflow.pytorch.log_model(model, name="ClassCondUNet")
-        logger.info("Finished class-conditional training. best_mse=%.6f", float(best))
+        logger.info(
+            "Finished class-conditional CIFAR-10 training. best_mse=%.6f", float(best)
+        )
         mlflow.log_artifact(log_path, artifact_path="logs")
     shutil.rmtree(os.path.dirname(log_path), ignore_errors=True)
 
