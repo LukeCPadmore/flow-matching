@@ -3,9 +3,9 @@ from typing import Callable
 
 
 @torch.no_grad()
-def euler_solver(f, x0, t0: float, t1: float, n_steps: int):
+def euler_solver(f: Callable, x0, t0: float, t1: float, n_steps: int):
     """Simple Euler integrator."""
-    assert n_steps >= 1, "n_steps must be >= 1"
+    # Split [0,1] into n_steps intervals
     h = (t1 - t0) / n_steps
     x = x0.clone()
     xs, ts = [], []
@@ -20,9 +20,9 @@ def euler_solver(f, x0, t0: float, t1: float, n_steps: int):
 
 
 @torch.no_grad()
-def rk2_solver(f, x0, t0: float, t1: float, n_steps: int):
-    """Heun's / RK2 integrator."""
-    assert n_steps >= 1, "n_steps must be >= 1"
+def rk2_solver(f:Callable, x0: torch.Tensor, t0: float, t1: float, n_steps: int):
+    """RK2 integrator."""
+    # Split [0,1] into n_steps intervals
     h = (t1 - t0) / n_steps
     x = x0.clone()
     xs, ts = [], []
