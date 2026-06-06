@@ -1,3 +1,4 @@
+from pathlib import Path
 import ast
 from mlflow.tracking import MlflowClient
 
@@ -17,4 +18,14 @@ def parse_int_list(s: str) -> tuple[int]:
     if not all(isinstance(x, int) for x in obj):
         raise ValueError("Non-integer element found")
     return obj
+
+
+def load_lightning_checkpoint_path_from_run(
+    run_id: str,
+    artifact_path: str = "checkpoints/best.ckpt",
+    *,
+    dst_path: str | None = None,
+) -> Path:
+    client = MlflowClient()
+    return Path(client.download_artifacts(run_id, artifact_path, dst_path=dst_path))
     

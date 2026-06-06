@@ -1,0 +1,48 @@
+seed_everything: 42
+
+model:
+  class_path: utils.FID.fid_lightning.FIDClassifierLightningModule
+  init_args:
+    classifier_cfg:
+      conv_block_channels: [1, 32, 64]
+      fid_emb: 128
+      n_classes: 10
+      image_size: 32
+    optim_cfg:
+      name: adamw
+      lr: 0.0003
+      weight_decay: 0.0001
+
+data:
+  class_path: utils.data_modules.MNISTDataModule
+  init_args:
+    batch_size: 64
+    data_path: data
+    num_workers: 0
+    transform: default
+    shuffle: true
+
+trainer:
+  default_root_dir: outputs/fid_classifier_mnist
+  max_epochs: 20
+  log_every_n_steps: 20
+  logger:
+    class_path: lightning.pytorch.loggers.MLFlowLogger
+    init_args:
+      experiment_name: FID Classifier MNIST
+      run_name: fid_classifier_mnist
+      tracking_uri: file:mlruns
+      save_dir: outputs/mlflow
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: outputs/fid_classifier_mnist/checkpoints
+        filename: best
+        monitor: val_acc
+        mode: max
+        save_top_k: 1
+        save_last: true
+        auto_insert_metric_name: false
+    - class_path: utils.FID.fid_lightning.FIDCheckpointArtifactCallback
+      init_args:
+        artifact_path: checkpoints

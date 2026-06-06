@@ -64,6 +64,11 @@ trainer:
         ode_solver_name: euler_solver
         sample_seed: 42
         artifact_prefix: samples/mnist_cond
+    - class_path: models.lightning.InputGridCallback
+      init_args:
+        n_images: 64
+        nrow: 8
+        artifact_prefix: inputs/mnist_cond
     - class_path: models.lightning.MLFlowArtifactCallback
       init_args:
         model_artifact_name: ClassCondUNet
