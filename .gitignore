@@ -8,3 +8,4 @@ optuna.db
 .venv/*
 mlartifacts/*
 checkpoints/*
+outputs/

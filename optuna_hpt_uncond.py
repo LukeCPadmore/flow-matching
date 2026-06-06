@@ -1,16 +1,16 @@
 from pathlib import Path
-import yaml
-import typer
 
 import mlflow
 import optuna
+import typer
+import yaml
 
-from utils.train import train_loop_uncond
+from models.config import log_config_kv
 from models.unet import UNet
-from utils.create_dataloaders import create_mnist_train_val_loaders, build_transform
+from utils.data_modules import MNISTDataModule
 from utils.logger_utils import trial_logger
 from utils.optuna_models import HPTYaml
-from models.config import log_config_kv
+from utils.train import train_loop_uncond
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -117,14 +117,15 @@ def run(
 ):
     hpt = load_hpt_config(config)
 
-    # dataloaders from config (use your dl_cfg fields)
-    train_loader, val_loader = create_mnist_train_val_loaders(
+    datamodule = MNISTDataModule(
         batch_size=hpt.dl_cfg.batch_size,
         data_path=Path(hpt.dl_cfg.data_path),
         num_workers=hpt.dl_cfg.num_workers,
+        transform=hpt.dl_cfg.transform,
         shuffle=hpt.dl_cfg.shuffle,
-        transform=build_transform(hpt.dl_cfg.transform),
     )
+    train_loader = datamodule.train_dataloader()
+    val_loader = datamodule.val_dataloader()
 
     study = create_study_from_cfg(hpt)
 

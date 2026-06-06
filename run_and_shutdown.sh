@@ -2,25 +2,7 @@
 set -euo pipefail
 
 SESSION="train_uncond"
-CMD="python run_train_uncond.py \
-  --experiment-name 'Flow Matching MNIST Unconditional' \
-  --run-name 'uncond_bs64_20ep' \
-  --epochs 50 \
-  --batch-size 64 \
-  --num-workers 0 \
-  --base-channels 64 \
-  --n-layers 3 \
-  --mult 2 \
-  --d-trunk 32 \
-  --d-concat 8 \
-  --group-norm-size 8 \
-  --d-time 64 \
-  --max-time-period 10000.0 \
-  --activation-name silu \
-  --upsample-mode nearest \
-  --optim-name adamw \
-  --lr 0.0003 \
-  --weight-decay 0.0001"
+CMD="python train.py fit --config configs/train/mnist_uncond.yaml"
 
 DO_SHUTDOWN=false
 KEEP_SESSION=false

@@ -1,9 +1,14 @@
+from __future__ import annotations
+
 from dataclasses import dataclass, is_dataclass, fields, asdict
+from typing import TYPE_CHECKING, Any, Literal, Mapping
+
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from typing import Tuple, Literal, Mapping, Any, Sequence
 import torch.nn as nn
 import torch.optim
-import optuna
+
+if TYPE_CHECKING:
+    import optuna
 
 
 OptimName = Literal["adam", "adamw", "sgd"]

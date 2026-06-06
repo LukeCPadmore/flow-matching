@@ -1,10 +1,8 @@
-from typing import Any, Dict, List, Literal, Optional, Union, Mapping
+from typing import Any, Dict, List, Literal, Optional
 from pathlib import Path
 
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 import optuna
-import torchvision.transforms as transforms
-from utils.create_dataloaders import default_transform
 from models.config import UNetConfig, OptimConfig
 
 
@@ -157,11 +155,10 @@ class OptunaStudyConfig(BaseModel):
 
 class DataloaderConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    data_path: str | Path = "/home/luke-padmore/Source/flow-matching-mnist/data"
+    data_path: str | Path = "data"
     batch_size: int = Field(default=64, ge=1)
     num_workers: int = Field(default=0, ge=0)
     transform: str = "default"
-    num_workers: int = Field(default=0, ge=0, le=4)
     shuffle: bool = True
 
 
