@@ -1,13 +1,16 @@
 from __future__ import annotations
 
-from pathlib import Path
+from dataclasses import dataclass
 from typing import Any
 
 import lightning.pytorch as pl
 import mlflow
 import mlflow.pytorch
+import matplotlib.pyplot as plt
+import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback
 
 from models.config import OptimConfig, UNetConfig
@@ -62,6 +65,192 @@ def _generate_samples(
         seed=sample_seed,
     )
     return samples, None
+
+
+@dataclass
+class BucketStats:
+    mse_sums: torch.Tensor
+    cossim_sums: torch.Tensor
+    log_norm_ratio_sums: torch.Tensor
+    freqs: torch.Tensor
+
+    @classmethod
+    def zeros(cls, num_buckets: int, device: torch.device) -> "BucketStats":
+        z = torch.zeros(num_buckets, device=device, dtype=torch.float32)
+        return cls(z.clone(), z.clone(), z.clone(), z.clone())
+
+    def update(
+        self,
+        mse_batch: torch.Tensor,
+        cossim_batch: torch.Tensor,
+        log_norm_ratio_batch: torch.Tensor,
+        bins: torch.Tensor,
+    ) -> None:
+        self.mse_sums += torch.bincount(bins, weights=mse_batch, minlength=self.freqs.numel())
+        self.cossim_sums += torch.bincount(bins, weights=cossim_batch, minlength=self.freqs.numel())
+        self.log_norm_ratio_sums += torch.bincount(
+            bins, weights=log_norm_ratio_batch, minlength=self.freqs.numel()
+        )
+        self.freqs += torch.bincount(bins, minlength=self.freqs.numel()).to(self.freqs.dtype)
+
+    def means(self) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        safe = self.freqs.clamp_min(1.0)
+        mse = torch.where(self.freqs > 0, self.mse_sums / safe, torch.zeros_like(self.mse_sums))
+        cossim = torch.where(self.freqs > 0, self.cossim_sums / safe, torch.zeros_like(self.cossim_sums))
+        log_ratio = torch.where(
+            self.freqs > 0, self.log_norm_ratio_sums / safe, torch.zeros_like(self.log_norm_ratio_sums)
+        )
+        return mse, cossim, log_ratio
+
+    def add_(self, other: "BucketStats") -> None:
+        self.mse_sums += other.mse_sums
+        self.cossim_sums += other.cossim_sums
+        self.log_norm_ratio_sums += other.log_norm_ratio_sums
+        self.freqs += other.freqs
+
+
+def _flow_matching_step_uncond(model, x1, loss_fn, device):
+    x1 = x1.to(device)
+    batch_size = x1.size(0)
+    x0 = torch.randn_like(x1)
+    t = torch.rand(batch_size, 1, 1, 1, device=device)
+    xt = (1 - t) * x0 + t * x1
+
+    v_est = model(xt, t)
+    v_true = x1 - x0
+    mse_batch = loss_fn(v_est, v_true).mean(dim=(1, 2, 3))
+    return mse_batch, t, v_est, v_true
+
+
+def _log_bucket_histograms(stats: BucketStats, *, epoch: int, step: int, artifact_prefix: str) -> None:
+    mse_m, cos_m, log_m = stats.means()
+    bucket_idx = torch.arange(stats.freqs.numel())
+    plots = {
+        "mse": mse_m,
+        "cosine_similarity": cos_m,
+        "log_norm_ratio": log_m,
+        "bin_frequency": stats.freqs,
+    }
+
+    for name, values in plots.items():
+        fig, ax = plt.subplots(figsize=(8, 4))
+        ax.bar(bucket_idx.cpu().numpy(), values.detach().cpu().numpy())
+        ax.set_title(f"epoch {epoch:03d} {name}")
+        ax.set_xlabel("t bucket")
+        ax.set_ylabel(name)
+        ax.set_xticks(bucket_idx.cpu().numpy())
+        fig.tight_layout()
+
+        fig.canvas.draw()
+        w, h = fig.canvas.get_width_height()
+        img = np.asarray(fig.canvas.buffer_rgba()).reshape(h, w, 4)
+        mlflow.log_image(img, artifact_file=f"{artifact_prefix}/{name}_epoch_{epoch:04d}_step_{step:06d}.png")
+        plt.close(fig)
+
+
+class UnconditionalDebugCallback(Callback):
+    def __init__(
+        self,
+        *,
+        every_n_steps: int = 100,
+        num_buckets: int = 20,
+        artifact_prefix: str = "debug/unconditional",
+    ) -> None:
+        self.every_n_steps = int(every_n_steps)
+        self.num_buckets = int(num_buckets)
+        self.artifact_prefix = artifact_prefix
+        self._loss_fn = nn.MSELoss(reduction="none")
+        self._boundaries = torch.linspace(0, 1, self.num_buckets - 1)
+        self._epoch_stats: BucketStats | None = None
+        self._overall_stats: BucketStats | None = None
+
+    def _maybe_log_summary(self, *, stats: BucketStats, epoch: int, step: int, suffix: str) -> None:
+        mse_m, cos_m, log_m = stats.means()
+        for i, v in enumerate(mse_m.detach().cpu().tolist()):
+            mlflow.log_metric(f"{suffix}_mse_bucket_{i:02d}", float(v), step=step)
+        for i, v in enumerate(cos_m.detach().cpu().tolist()):
+            mlflow.log_metric(f"{suffix}_cossim_bucket_{i:02d}", float(v), step=step)
+        for i, v in enumerate(log_m.detach().cpu().tolist()):
+            mlflow.log_metric(f"{suffix}_log_norm_ratio_bucket_{i:02d}", float(v), step=step)
+        mlflow.log_metric(f"{suffix}_mse_mean", float(mse_m.mean().item()), step=step)
+        mlflow.log_metric(f"{suffix}_cossim_mean", float(cos_m.mean().item()), step=step)
+        mlflow.log_metric(f"{suffix}_log_norm_ratio_mean", float(log_m.mean().item()), step=step)
+        _log_bucket_histograms(stats, epoch=epoch, step=step, artifact_prefix=self.artifact_prefix)
+
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if getattr(pl_module, "is_conditional", False):
+            raise RuntimeError("UnconditionalDebugCallback requires an unconditional model.")
+        self._epoch_stats = BucketStats.zeros(self.num_buckets, pl_module.device)
+        self._overall_stats = BucketStats.zeros(self.num_buckets, pl_module.device)
+
+    def on_train_epoch_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        self._epoch_stats = BucketStats.zeros(self.num_buckets, pl_module.device)
+
+    def on_train_batch_end(
+        self,
+        trainer: pl.Trainer,
+        pl_module: pl.LightningModule,
+        outputs,
+        batch,
+        batch_idx: int,
+    ) -> None:
+        if not trainer.is_global_zero or trainer.sanity_checking:
+            return
+        if self._epoch_stats is None or self._overall_stats is None:
+            raise RuntimeError("UnconditionalDebugCallback was not initialised correctly.")
+
+        images = batch[0] if isinstance(batch, (tuple, list)) else batch
+        was_training = pl_module.training
+        pl_module.eval()
+        with torch.no_grad():
+            mse_batch, t, v_est, v_true = _flow_matching_step_uncond(
+                pl_module.generator,
+                images,
+                self._loss_fn,
+                pl_module.device,
+            )
+            cossim_batch = F.cosine_similarity(v_est.flatten(1), v_true.flatten(1), dim=1)
+            v_est_norm = torch.linalg.vector_norm(v_est.flatten(1), dim=1)
+            v_true_norm = torch.linalg.vector_norm(v_true.flatten(1), dim=1)
+            log_ratio_batch = torch.log(v_est_norm + 1e-6) - torch.log(v_true_norm + 1e-6)
+            bins = torch.bucketize(t[:, 0, 0, 0], self._boundaries.to(pl_module.device), right=True)
+            self._epoch_stats.update(mse_batch, cossim_batch, log_ratio_batch, bins)
+            self._overall_stats.update(mse_batch, cossim_batch, log_ratio_batch, bins)
+
+        if was_training:
+            pl_module.train()
+
+        if self.every_n_steps > 0 and (trainer.global_step + 1) % self.every_n_steps == 0:
+            self._maybe_log_summary(
+                stats=self._epoch_stats,
+                epoch=trainer.current_epoch,
+                step=trainer.global_step,
+                suffix="debug",
+            )
+
+    def on_train_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if not trainer.is_global_zero or trainer.sanity_checking:
+            return
+        if self._epoch_stats is None:
+            raise RuntimeError("UnconditionalDebugCallback was not initialised correctly.")
+        self._maybe_log_summary(
+            stats=self._epoch_stats,
+            epoch=trainer.current_epoch,
+            step=trainer.global_step,
+            suffix="debug_epoch",
+        )
+
+    def on_fit_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if not trainer.is_global_zero or trainer.sanity_checking:
+            return
+        if self._overall_stats is None:
+            raise RuntimeError("UnconditionalDebugCallback was not initialised correctly.")
+        self._maybe_log_summary(
+            stats=self._overall_stats,
+            epoch=trainer.current_epoch,
+            step=trainer.global_step,
+            suffix="debug_overall",
+        )
 
 
 class BaseFlowMatchingModule(pl.LightningModule):
@@ -384,19 +573,9 @@ class FIDCallback(Callback):
 
 
 class MLFlowArtifactCallback(Callback):
-    def __init__(self, model_artifact_name: str) -> None:
+    def __init__(self, model_artifact_name: str, config_path: str) -> None:
         self.model_artifact_name = model_artifact_name
-
-    def _find_config_file(self, trainer: pl.Trainer) -> Path | None:
-        candidates: list[Path] = []
-        log_dir = getattr(trainer, "log_dir", None)
-        if log_dir is not None:
-            candidates.append(Path(log_dir) / "config.yaml")
-        candidates.append(Path(trainer.default_root_dir) / "config.yaml")
-        for path in candidates:
-            if path.exists():
-                return path
-        return None
+        self.config_path = config_path
 
     def on_fit_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if not trainer.is_global_zero:
@@ -411,9 +590,7 @@ class MLFlowArtifactCallback(Callback):
         if last_model_path:
             mlflow.log_artifact(last_model_path, artifact_path="checkpoints")
 
-        config_path = self._find_config_file(trainer)
-        if config_path is not None:
-            mlflow.log_artifact(str(config_path), artifact_path="configs")
+        mlflow.log_artifact(self.config_path, artifact_path="configs")
 
         best_score = getattr(checkpoint_callback, "best_model_score", None)
         if best_score is not None:

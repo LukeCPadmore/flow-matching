@@ -72,3 +72,4 @@ trainer:
     - class_path: models.lightning.MLFlowArtifactCallback
       init_args:
         model_artifact_name: ClassCondUNet
+        config_path: configs/train/mnist_cond.yaml
