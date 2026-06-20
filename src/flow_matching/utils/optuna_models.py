@@ -3,7 +3,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 import optuna
-from models.config import UNetConfig
+from src.flow_matching.models.config import UNetConfig
 
 
 def log_pydantic_config_kv(cfg: BaseModel, logger, *, prefix: str = "cfg"):

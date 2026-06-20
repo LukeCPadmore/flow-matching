@@ -1,4 +1,4 @@
-from utils.FID.fid_lightning import (
+from src.flow_matching.utils.FID.fid_lightning import (
     FIDBackbone,
     FIDCheckpointArtifactCallback,
     FIDClassifier,

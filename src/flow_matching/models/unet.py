@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import math
-from models.config import UNetConfig
+from src.flow_matching.models.config import UNetConfig
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -310,13 +310,15 @@ class Decoder(nn.Module):
         upsample_mode="nearest",
         activation_cls: type[nn.Module] | None = None,
         dropout_dec_list=None,
+        out_channels: int | None = None,
     ):
         """
         Expects list of channels with the same orders as te encoder
         """
         super().__init__()
         chls = channels.copy()
-        self.out_channels = chls.pop(0)
+        in_channels = chls.pop(0)
+        self.out_channels = int(in_channels if out_channels is None else out_channels)
         self.channels = chls[::-1]
         self.channels.append(self.channels[-1])
         dropout_dec_list = dropout_dec_list or [0] * (len(self.channels) - 1)
@@ -392,6 +394,7 @@ class UNet(nn.Module):
     def __init__(
         self,
         channels,
+        out_channels: int | None = None,
         d_trunk=32,
         d_concat=8,
         group_norm_size=8,
@@ -423,6 +426,7 @@ class UNet(nn.Module):
             upsample_mode=upsample_mode,
             activation_cls=activation_cls,
             dropout_dec_list=dropout_enc_dec_list[::-1],
+            out_channels=out_channels,
         )
         self.bottleneck = Bottleneck(
             self.channels[-1],
@@ -467,6 +471,7 @@ class UNet(nn.Module):
     ) -> "UNet":
         return cls(
             channels=list(cfg.channels),
+            out_channels=cfg.out_channels,
             d_trunk=cfg.d_trunk,
             d_concat=cfg.d_concat,
             group_norm_size=cfg.group_norm_size,
@@ -509,19 +514,9 @@ class SimpleColouriser(nn.Module):
         self.core = core
 
     @classmethod
-    def from_config(
-        cls,
-        cfg: UNetConfig,
-        conditioning_model: nn.Module | None = None,
-    ) -> "SimpleColouriser":
-        if conditioning_model is None:
-            conditioning_model = GreyScaleEncoder(
-                cfg.d_trunk,
-                hidden_channels=cfg.base_channels,
-                activation_cls=cfg.activation_cls,
-            )
-        core = UNet.from_config(cfg, conditioning_model=conditioning_model)
+    def from_config(cls, cfg: UNetConfig) -> "SimpleColouriser":
+        core = UNet.from_config(cfg)
         return cls(core)
 
-    def forward(self, ab_t, L, t):
-        return self.core(ab_t, t, L)
+    def forward(self, x, t):
+        return self.core(x, t)

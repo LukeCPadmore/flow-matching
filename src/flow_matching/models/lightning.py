@@ -13,16 +13,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback
 
-from models.config import UNetConfig, make_optimizer
-from models.ode_solvers import (
+from src.flow_matching.models.config import UNetConfig, make_optimizer
+from src.flow_matching.models.ode_solvers import (
     get_ode_solver_from_name,
     sample_conditional,
     sample_unconditional,
 )
-from models.unet import ClassCondUNet, UNet, SimpleColouriser
-from utils.FID.fid_evaluation import build_fid_metric
-from utils.FID.fid_lightning import FIDClassifierLightningModule
-from utils.train import create_pil_image, flow_matching_step, flow_matching_step_cfg
+from src.flow_matching.models.unet import ClassCondUNet, UNet, SimpleColouriser
+from src.flow_matching.utils.FID.fid_evaluation import build_fid_metric
+from src.flow_matching.utils.FID.fid_lightning import FIDClassifierLightningModule
+from src.flow_matching.utils.train import (
+    create_pil_image,
+    flow_matching_step,
+    flow_matching_step_cfg,
+    unpack_batch,
+)
 
 
 def _generate_samples(
@@ -232,7 +237,7 @@ class UnconditionalDebugCallback(Callback):
                 "UnconditionalDebugCallback was not initialised correctly."
             )
 
-        images = batch[0] if isinstance(batch, (tuple, list)) else batch
+        images, _ = unpack_batch(batch)
         was_training = pl_module.training
         pl_module.eval()
         with torch.no_grad():
@@ -336,7 +341,8 @@ class BaseFlowMatchingModule(pl.LightningModule):
         raise NotImplementedError
 
     def _batch_size(self, batch) -> int:
-        return int(batch[0].shape[0])
+        images, _ = unpack_batch(batch)
+        return int(images.shape[0])
 
     def training_step(self, batch, batch_idx):
         loss = self._loss(batch)
@@ -387,7 +393,7 @@ class UnconditionalFlowMatchingModule(BaseFlowMatchingModule):
         return self.generator(x, t)
 
     def _loss(self, batch) -> torch.Tensor:
-        x, _ = batch
+        x, _ = unpack_batch(batch)
         return flow_matching_step(self.generator, x, self.loss_fn, self.device)
 
 
@@ -433,7 +439,11 @@ class ClassConditionalFlowMatchingModule(BaseFlowMatchingModule):
         return self.generator(x, t, y)
 
     def _loss(self, batch) -> torch.Tensor:
-        x, y = batch
+        x, y = unpack_batch(batch)
+        if y is None:
+            raise ValueError(
+                "ClassConditionalFlowMatchingModule requires labels. Set datamodule.drop_labels=False."
+            )
         return flow_matching_step_cfg(
             self.generator,
             x,
@@ -466,13 +476,11 @@ class SimpleColouriserFlowMatchingModule(BaseFlowMatchingModule):
     def _build_generator(self) -> nn.Module:
         return SimpleColouriser.from_config(self.unet_cfg)
 
-    def forward(self, LAB_batch: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        L = LAB_batch[:, :1, ...]  # [B, 1, H, W]
-        ab_t = LAB_batch[:, 1:, ...]  # [B, 2, H, W]
-        return self.generator(ab_t, L, t)
+    def forward(self, LAB_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return self.generator(LAB_t, t)
 
     def _loss(self, batch) -> torch.Tensor:
-        LAB, _ = batch
+        LAB, _ = unpack_batch(batch)
         LAB = LAB.to(self.device)
         L = LAB[:, :1, ...]
         ab = LAB[:, 1:, ...]
@@ -480,7 +488,8 @@ class SimpleColouriserFlowMatchingModule(BaseFlowMatchingModule):
         x0 = torch.randn_like(ab)
         t = torch.rand(B, 1, 1, 1, device=ab.device, dtype=ab.dtype)
         ab_t = (1 - t) * x0 + t * ab
-        v_est = self.generator(ab_t, L, t)
+        LAB_t = torch.cat([L, ab_t], dim=1)
+        v_est = self.generator(LAB_t, t)
         v_true = ab - x0
         return self.loss_fn(v_est, v_true)
 
@@ -657,12 +666,7 @@ class InputGridCallback(Callback):
 
         loader = datamodule.train_dataloader()
         batch = next(iter(loader))
-        if isinstance(batch, (tuple, list)):
-            images = batch[0]
-            labels = batch[1] if len(batch) > 1 else None
-        else:
-            images = batch
-            labels = None
+        images, labels = unpack_batch(batch)
 
         sample_mean = getattr(datamodule, "sample_mean", None)
         sample_std = getattr(datamodule, "sample_std", None)
@@ -716,7 +720,7 @@ class FIDCallback(Callback):
         loader = trainer.datamodule.val_dataloader()
         with torch.no_grad():
             for batch in loader:
-                images = batch[0] if isinstance(batch, (tuple, list)) else batch
+                images, _ = unpack_batch(batch)
                 self._fid_metric.update(images, real=True)
 
     def on_validation_epoch_end(

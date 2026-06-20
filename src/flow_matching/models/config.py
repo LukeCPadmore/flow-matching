@@ -51,6 +51,7 @@ def dataclass_to_mlflow_params(
 class UNetConfig:
     # architecture
     in_channels: int = 1
+    out_channels: int | None = None
     base_channels: int = 16
     mult: float = 2  # e.g. 16 -> 32 in next layer with
     n_layers: int = 3

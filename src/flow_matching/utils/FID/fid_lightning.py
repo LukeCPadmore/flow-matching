@@ -8,8 +8,9 @@ import torch
 import torch.nn as nn
 from lightning.pytorch.callbacks import Callback
 
-from models.config import OptimConfig
-from utils.mlflow_tracking_utils import load_lightning_checkpoint_path_from_run
+from src.flow_matching.models.config import make_optimizer
+from src.flow_matching.utils.mlflow_tracking_utils import load_lightning_checkpoint_path_from_run
+from src.flow_matching.utils.train import unpack_batch
 
 
 class FIDBackbone(nn.Module):
@@ -95,7 +96,7 @@ class FIDClassifierLightningModule(pl.LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.classifier_cfg = dict(classifier_cfg or {})
-        self.optim_cfg = OptimConfig(**(optim_cfg or {}))
+        self.optim_cfg = dict(optim_cfg or {})
         self.model = FIDClassifier(**self.classifier_cfg)
         self.loss_fn = nn.CrossEntropyLoss()
 
@@ -107,7 +108,11 @@ class FIDClassifierLightningModule(pl.LightningModule):
         return self.model(x)
 
     def _shared_step(self, batch) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        x, y = batch
+        x, y = unpack_batch(batch)
+        if y is None:
+            raise ValueError(
+                "FIDClassifierLightningModule requires labels. Set datamodule.drop_labels=False."
+            )
         logits = self(x)
         loss = self.loss_fn(logits, y)
         return logits, y, loss
@@ -161,7 +166,12 @@ class FIDClassifierLightningModule(pl.LightningModule):
         return loss
 
     def configure_optimizers(self):
-        return self.optim_cfg.make_optimizer(self.parameters())
+        return make_optimizer(
+            self.parameters(),
+            optimizer_name=str(self.optim_cfg.get("name", "adamw")),
+            lr=float(self.optim_cfg.get("lr", 3e-4)),
+            weight_decay=float(self.optim_cfg.get("weight_decay", 1e-4)),
+        )
 
     @classmethod
     def load_backbone_from_mlflow_run(

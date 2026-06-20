@@ -1,7 +1,7 @@
 seed_everything: 42
 
 model:
-  class_path: models.lightning.ClassConditionalFlowMatchingModule
+  class_path: src.flow_matching.models.lightning.ClassConditionalFlowMatchingModule
   init_args:
     unet_cfg:
       in_channels: 1
@@ -24,7 +24,7 @@ model:
     p_drop: 0.2
 
 data:
-  class_path: utils.data_modules.MNISTDataModule
+  class_path: src.flow_matching.utils.data_modules.MNISTDataModule
   init_args:
     batch_size: 64
     data_path: data
@@ -53,7 +53,7 @@ trainer:
         save_top_k: 1
         save_last: true
         auto_insert_metric_name: false
-    - class_path: models.lightning.ClassConditionalSampleCallback
+    - class_path: src.flow_matching.models.lightning.ClassConditionalSampleCallback
       init_args:
         every_n_epochs: 5
         n_images: 100
@@ -63,12 +63,12 @@ trainer:
         ode_solver_name: euler_solver
         sample_seed: 42
         artifact_prefix: samples/mnist_cond
-    - class_path: models.lightning.InputGridCallback
+    - class_path: src.flow_matching.models.lightning.InputGridCallback
       init_args:
         n_images: 64
         nrow: 8
         artifact_prefix: inputs/mnist_cond
-    - class_path: models.lightning.MLFlowArtifactCallback
+    - class_path: src.flow_matching.models.lightning.MLFlowArtifactCallback
       init_args:
         model_artifact_name: ClassCondUNet
         config_path: configs/train/mnist_cond.yaml

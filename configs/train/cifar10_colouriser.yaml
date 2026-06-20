@@ -1,10 +1,11 @@
 seed_everything: 42
 
 model:
-  class_path: models.lightning.SimpleColouriserFlowMatchingModule
+  class_path: src.flow_matching.models.lightning.SimpleColouriserFlowMatchingModule
   init_args:
     unet_cfg:
-      in_channels: 2
+      in_channels: 3
+      out_channels: 2
       base_channels: 64
       mult: 2.0
       n_layers: 3
@@ -20,12 +21,13 @@ model:
     weight_decay: 0.0001
 
 data:
-  class_path: utils.data_modules.CIFAR10ColouriserDataModule
+  class_path: src.flow_matching.utils.data_modules.CIFAR10ColouriserDataModule
   init_args:
     batch_size: 128
     data_path: data
     num_workers: 4
     shuffle: true
+    drop_labels: true
 
 trainer:
   default_root_dir: outputs/cifar10_colouriser
@@ -48,6 +50,6 @@ trainer:
         save_top_k: 1
         save_last: true
         auto_insert_metric_name: false
-    - class_path: models.lightning.MLFlowArtifactCallback
+    - class_path: src.flow_matching.models.lightning.MLFlowArtifactCallback
       init_args:
         model_artifact_name: SimpleColouriser

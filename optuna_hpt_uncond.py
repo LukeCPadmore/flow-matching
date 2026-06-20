@@ -5,12 +5,12 @@ import optuna
 import typer
 import yaml
 
-from models.config import log_config_kv, make_optimizer
-from models.unet import UNet
-from utils.data_modules import MNISTDataModule
-from utils.logger_utils import trial_logger
-from utils.optuna_models import HPTYaml
-from utils.train import train_loop_uncond
+from src.flow_matching.models.config import log_config_kv, make_optimizer
+from src.flow_matching.models.unet import UNet
+from src.utils.data_modules import MNISTDataModule
+from src.utils.logger_utils import trial_logger
+from src.utils.optuna_models import HPTYaml
+from src.utils.train import train_loop_uncond
 
 app = typer.Typer(no_args_is_help=True)
 

@@ -1,0 +1,32 @@
+Metadata-Version: 2.4
+Name: flow-matching
+Version: 0.1.0
+Summary: Add your description here
+Requires-Python: >=3.13
+Description-Content-Type: text/markdown
+Requires-Dist: jsonargparse[signatures]>=4.27.7
+Requires-Dist: lightning>=2.6.5
+Requires-Dist: matplotlib>=3.10.9
+Requires-Dist: mlflow>=3.13.0
+Requires-Dist: optuna>=4.9.0
+Requires-Dist: pyyaml>=6.0.3
+Requires-Dist: scikit-image>=0.26.0
+Requires-Dist: torch>=2.12.0
+Requires-Dist: torchvision>=0.27.0
+
+```bash
+mlflow ui --backend-store-uri sqlite:////home/luke-padmore/Source/flow-matching-mnist/mlflow.db --host 127.0.0.1 --port 5000
+export MLFLOW_TRACKING_URI="sqlite:////home/luke-padmore/Source/flow-matching-mnist/mlflow.db"
+
+export MLFLOW_TRACKING_URI="file:$(pwd)/mlruns"
+mlflow ui --backend-store-uri "file:$(pwd)/mlruns" --host 127.0.0.1 --port 5000
+
+```
+
+## Training
+
+```bash
+python train.py fit --config configs/train/mnist_uncond.yaml
+python train.py fit --config configs/train/mnist_cond.yaml
+python train.py fit --config configs/train/cifar10_cond.yaml
+```

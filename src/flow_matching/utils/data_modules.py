@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import kornia
 import lightning.pytorch as pl
 import torch
 import torchvision
@@ -26,28 +25,118 @@ class DropLabelDataset(Dataset):
         return x
 
 
+_RGB_TO_XYZ = torch.tensor(
+    [
+        [0.4124564, 0.3575761, 0.1804375],
+        [0.2126729, 0.7151522, 0.0721750],
+        [0.0193339, 0.1191920, 0.9503041],
+    ],
+    dtype=torch.float32,
+)
+_XYZ_TO_RGB = torch.tensor(
+    [
+        [3.2404542, -1.5371385, -0.4985314],
+        [-0.9692660, 1.8760108, 0.0415560],
+        [0.0556434, -0.2040259, 1.0572252],
+    ],
+    dtype=torch.float32,
+)
+_XN = 0.95047
+_YN = 1.0
+_ZN = 1.08883
+_DELTA = 6.0 / 29.0
+_DELTA_CUBED = _DELTA**3
+_DELTA_SQUARED = _DELTA**2
+
+
+def _srgb_to_linear(rgb: torch.Tensor) -> torch.Tensor:
+    return torch.where(
+        rgb <= 0.04045,
+        rgb / 12.92,
+        ((rgb + 0.055) / 1.055).clamp_min(0.0) ** 2.4,
+    )
+
+
+def _linear_to_srgb(rgb: torch.Tensor) -> torch.Tensor:
+    return torch.where(
+        rgb <= 0.0031308,
+        12.92 * rgb,
+        1.055 * rgb.clamp_min(0.0) ** (1.0 / 2.4) - 0.055,
+    )
+
+
+def _f_lab(t: torch.Tensor) -> torch.Tensor:
+    return torch.where(
+        t > _DELTA_CUBED,
+        t.clamp_min(0.0) ** (1.0 / 3.0),
+        t / (3.0 * _DELTA_SQUARED) + 4.0 / 29.0,
+    )
+
+
+def _f_lab_inv(t: torch.Tensor) -> torch.Tensor:
+    return torch.where(
+        t > _DELTA,
+        t**3,
+        3.0 * _DELTA_SQUARED * (t - 4.0 / 29.0),
+    )
+
+
 class RGBToLAB:
     def __call__(self, img: torch.Tensor) -> torch.Tensor:
-        img = img.cpu()
+        # img: [3, H, W] in [0, 1]
         single = img.ndim == 3
-
         if single:
             img = img.unsqueeze(0)
 
-        lab = kornia.color.rgb_to_lab(img)
+        rgb = img.clamp(0.0, 1.0).permute(0, 2, 3, 1)
+        rgb_lin = _srgb_to_linear(rgb)
+        xyz = rgb_lin @ _RGB_TO_XYZ.to(device=rgb.device, dtype=rgb.dtype).T
 
-        lab[:, :1] = lab[:, :1] / 100.0
-        lab[:, 1:] = lab[:, 1:] / 128.0
+        x = xyz[..., 0] / _XN
+        y = xyz[..., 1] / _YN
+        z = xyz[..., 2] / _ZN
+
+        fx = _f_lab(x)
+        fy = _f_lab(y)
+        fz = _f_lab(z)
+
+        lab = torch.stack(
+            [116.0 * fy - 16.0, 500.0 * (fx - fy), 200.0 * (fy - fz)],
+            dim=1,
+        )
+
+        lab[:, :1] /= 100.0
+        lab[:, 1:] /= 128.0
 
         return lab.squeeze(0) if single else lab
 
 
 def lab_to_rgb(lab: torch.Tensor) -> torch.Tensor:
-    lab = lab.clone()
-    lab[:, :1] = lab[:, :1] * 100.0
-    lab[:, 1:] = lab[:, 1:] * 128.0
+    # lab: [B, 3, H, W] or [3, H, W]
+    single = lab.ndim == 3
+    if single:
+        lab = lab.unsqueeze(0)
 
-    return kornia.color.lab_to_rgb(lab).clamp(0.0, 1.0)
+    lab = lab.clone()
+    lab[:, :1] *= 100.0
+    lab[:, 1:] *= 128.0
+
+    l = lab[:, 0]
+    a = lab[:, 1]
+    b = lab[:, 2]
+
+    fy = (l + 16.0) / 116.0
+    fx = fy + a / 500.0
+    fz = fy - b / 200.0
+
+    x = _XN * _f_lab_inv(fx)
+    y = _YN * _f_lab_inv(fy)
+    z = _ZN * _f_lab_inv(fz)
+
+    xyz = torch.stack([x, y, z], dim=-1)
+    rgb_lin = xyz @ _XYZ_TO_RGB.to(device=lab.device, dtype=lab.dtype).T
+    rgb = _linear_to_srgb(rgb_lin).permute(0, 3, 1, 2).clamp(0.0, 1.0)
+    return rgb.squeeze(0) if single else rgb
 
 
 MNIST_DEFAULT_TRANSFORM = v2.Compose(

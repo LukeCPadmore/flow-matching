@@ -9,10 +9,10 @@ from pathlib import Path
 
 import yaml
 
-from utils.mlflow_tracking_utils import get_run_param, parse_int_list
-from utils.FID.fid_evaluation import evaluate_fid_with_lightning_backbone
-from utils.data_modules import MNISTDataModule
-from models.ode_solvers import get_ode_solver_from_name, sample_unconditional
+from src.flow_matching.utils.mlflow_tracking_utils import get_run_param, parse_int_list
+from src.flow_matching.utils.FID.fid_evaluation import evaluate_fid_with_lightning_backbone
+from src.flow_matching.utils.data_modules import MNISTDataModule
+from src.flow_matching.models.ode_solvers import get_ode_solver_from_name, sample_unconditional
 
 def run_eval(
     generator_run_id: str,

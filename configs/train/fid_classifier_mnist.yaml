@@ -1,7 +1,7 @@
 seed_everything: 42
 
 model:
-  class_path: utils.FID.fid_lightning.FIDClassifierLightningModule
+  class_path: src.flow_matching.utils.FID.fid_lightning.FIDClassifierLightningModule
   init_args:
     classifier_cfg:
       conv_block_channels: [1, 32, 64]
@@ -14,7 +14,7 @@ model:
       weight_decay: 0.0001
 
 data:
-  class_path: utils.data_modules.MNISTDataModule
+  class_path: src.flow_matching.utils.data_modules.MNISTDataModule
   init_args:
     batch_size: 64
     data_path: data
@@ -43,6 +43,6 @@ trainer:
         save_top_k: 1
         save_last: true
         auto_insert_metric_name: false
-    - class_path: utils.FID.fid_lightning.FIDCheckpointArtifactCallback
+    - class_path: src.flow_matching.utils.FID.fid_lightning.FIDCheckpointArtifactCallback
       init_args:
         artifact_path: checkpoints

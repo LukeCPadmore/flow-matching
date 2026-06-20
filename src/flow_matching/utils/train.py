@@ -3,7 +3,7 @@ import torch.nn as nn
 from PIL import ImageDraw
 from torchvision.utils import make_grid
 from torchvision.transforms.functional import to_pil_image
-from models.ode_solvers import (
+from src.flow_matching.models.ode_solvers import (
     euler_solver,
     sample_conditional,
     sample_unconditional,
@@ -15,6 +15,16 @@ def _log(logger, message: str, *args) -> None:
         logger.info(message, *args)
     else:
         print(message % args)
+
+
+def unpack_batch(batch):
+    if isinstance(batch, (tuple, list)):
+        if not batch:
+            raise ValueError("Expected a non-empty batch.")
+        images = batch[0]
+        labels = batch[1] if len(batch) > 1 else None
+        return images, labels
+    return batch, None
 
 
 def flow_matching_step(model, x1, loss_fn, device):
@@ -135,7 +145,8 @@ def train_loop_uncond(
         model.train()
         running = 0.0
 
-        for x1, _ in train_loader:
+        for batch in train_loader:
+            x1, _ = unpack_batch(batch)
             optim.zero_grad(set_to_none=True)
             mse = flow_matching_step(model, x1, loss_fn, device)
             mse.backward()
@@ -166,7 +177,8 @@ def train_loop_uncond(
             model.eval()
             v_running = 0.0
             with torch.no_grad():
-                for x1, _ in val_loader:
+                for batch in val_loader:
+                    x1, _ = unpack_batch(batch)
                     mse = flow_matching_step(model, x1, loss_fn, device)
                     v_running += float(mse.item())
             val_mse_epoch = v_running / len(val_loader)
@@ -270,7 +282,12 @@ def train_loop_class_cond(
         model.train()
         running = 0.0
 
-        for x1, y in train_loader:
+        for batch in train_loader:
+            x1, y = unpack_batch(batch)
+            if y is None:
+                raise ValueError(
+                    "train_loop_class_cond requires labels. Set datamodule.drop_labels=False."
+                )
             optim.zero_grad(set_to_none=True)
             mse = flow_matching_step_cfg(
                 model=model,
@@ -307,7 +324,12 @@ def train_loop_class_cond(
             model.eval()
             v_running = 0.0
             with torch.no_grad():
-                for x1, y in val_loader:
+                for batch in val_loader:
+                    x1, y = unpack_batch(batch)
+                    if y is None:
+                        raise ValueError(
+                            "train_loop_class_cond requires labels. Set datamodule.drop_labels=False."
+                        )
                     mse = flow_matching_step_cfg(
                         model=model,
                         x1=x1,
@@ -352,7 +374,7 @@ def train_loop_class_cond(
                     )
                 sample_steps = 50 if sample_ode_steps is None else sample_ode_steps
                 samples = sample_conditional(
-                    model=model,ß
+                    model=model,
                     y=torch.arange(0, sample_classes).repeat(sample_n_rows),
                     image_shape=sample_image_shape,
                     ode_solver=sample_ode_solver,
