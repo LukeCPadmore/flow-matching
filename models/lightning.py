@@ -12,13 +12,13 @@ import torch.nn as nn
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.loggers import MLFlowLogger
 
-from models.config import OptimConfig, UNetConfig
+from models.config import UNetConfig, make_optimizer
 from models.ode_solvers import (
     get_ode_solver_from_name,
     sample_conditional,
     sample_unconditional,
 )
-from models.unet import ClassCondUNet, UNet
+from models.unet import ClassCondUNet, UNet, SimpleColouriser
 from utils.train import create_pil_image, flow_matching_step, flow_matching_step_cfg
 
 
@@ -70,12 +70,16 @@ class BaseFlowMatchingModule(pl.LightningModule):
     def __init__(
         self,
         unet_cfg: dict[str, Any] | None = None,
-        optim_cfg: dict[str, Any] | None = None,
+        optimizer_name: str = "adamw",
+        lr: float = 3e-4,
+        weight_decay: float = 1e-4,
     ) -> None:
         super().__init__()
         self.save_hyperparameters()
         self.unet_cfg = UNetConfig(**(unet_cfg or {}))
-        self.optim_cfg = OptimConfig(**(optim_cfg or {}))
+        self.optimizer_name = str(optimizer_name)
+        self.lr = float(lr)
+        self.weight_decay = float(weight_decay)
         self.loss_fn = nn.MSELoss()
         self.generator = self._build_generator()
 
@@ -83,7 +87,12 @@ class BaseFlowMatchingModule(pl.LightningModule):
         raise NotImplementedError
 
     def configure_optimizers(self):
-        return self.optim_cfg.make_optimizer(self.parameters())
+        return make_optimizer(
+            self.parameters(),
+            optimizer_name=self.optimizer_name,
+            lr=self.lr,
+            weight_decay=self.weight_decay,
+        )
 
     def _loss(self, batch) -> torch.Tensor:
         raise NotImplementedError
@@ -151,7 +160,9 @@ class ClassConditionalFlowMatchingModule(BaseFlowMatchingModule):
     def __init__(
         self,
         unet_cfg: dict[str, Any] | None = None,
-        optim_cfg: dict[str, Any] | None = None,
+        optimizer_name: str = "adamw",
+        lr: float = 3e-4,
+        weight_decay: float = 1e-4,
         n_classes: int = 10,
         d_cls_emb: int = 128,
         null_id: int | None = None,
@@ -164,14 +175,23 @@ class ClassConditionalFlowMatchingModule(BaseFlowMatchingModule):
         self.class_vocab_size = max(self.n_classes, self.null_id + 1)
         self.d_cls_emb = int(d_cls_emb)
         self.p_drop = float(p_drop)
-        super().__init__(unet_cfg=unet_cfg, optim_cfg=optim_cfg)
+        super().__init__(
+            unet_cfg=unet_cfg,
+            optimizer_name=optimizer_name,
+            lr=lr,
+            weight_decay=weight_decay,
+        )
         self.save_hyperparameters()
 
     def _build_generator(self) -> nn.Module:
         core = UNet.from_config(self.unet_cfg)
-        return ClassCondUNet(core=core, n_classes=self.class_vocab_size, d_cls_emb=self.d_cls_emb)
+        return ClassCondUNet(
+            core=core, n_classes=self.class_vocab_size, d_cls_emb=self.d_cls_emb
+        )
 
-    def forward(self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, t: torch.Tensor, y: torch.Tensor
+    ) -> torch.Tensor:
         return self.generator(x, t, y)
 
     def _loss(self, batch) -> torch.Tensor:
@@ -187,7 +207,130 @@ class ClassConditionalFlowMatchingModule(BaseFlowMatchingModule):
         )
 
 
-class FlowMatchingSampleCallback(Callback):
+class SimpleColouriserFlowMatchingModule(BaseFlowMatchingModule):
+    model_artifact_name = "SimpleColouriser"
+
+    def __init__(
+        self,
+        unet_cfg: dict[str, Any] | None = None,
+        optimizer_name: str = "adamw",
+        lr: float = 3e-4,
+        weight_decay: float = 1e-4,
+    ) -> None:
+        super().__init__(
+            unet_cfg=unet_cfg,
+            optimizer_name=optimizer_name,
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+        self.save_hyperparameters()
+
+    def _build_generator(self) -> nn.Module:
+        return SimpleColouriser.from_config(self.unet_cfg)
+
+    def forward(self, LAB_batch: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        L = LAB_batch[:, :1, ...]  # [B, 1, H, W]
+        ab_t = LAB_batch[:, 1:, ...]  # [B, 2, H, W]
+        return self.generator(ab_t, L, t)
+
+    def _loss(self, batch) -> torch.Tensor:
+        LAB, _ = batch
+        LAB = LAB.to(self.device)
+        L = LAB[:, :1, ...]
+        ab = LAB[:, 1:, ...]
+        B = ab.shape[0]
+        x0 = torch.randn_like(ab)
+        t = torch.rand(B, 1, 1, 1, device=ab.device, dtype=ab.dtype)
+        ab_t = (1 - t) * x0 + t * ab
+        v_est = self.generator(ab_t, L, t)
+        v_true = ab - x0
+        return self.loss_fn(v_est, v_true)
+
+
+def _get_sampling_metadata(trainer: pl.Trainer) -> tuple[tuple[int, ...], Any, Any]:
+    datamodule = trainer.datamodule
+    if datamodule is None:
+        raise RuntimeError(
+            "Sampling callbacks require a datamodule with image_shape."
+        )
+
+    image_shape = getattr(datamodule, "image_shape", None)
+    if image_shape is None:
+        raise RuntimeError("Datamodule must expose image_shape for sampling callbacks.")
+
+    sample_mean = getattr(datamodule, "sample_mean", None)
+    sample_std = getattr(datamodule, "sample_std", None)
+    return image_shape, sample_mean, sample_std
+
+
+def _log_sample_image(trainer: pl.Trainer, image, artifact_prefix: str) -> None:
+    logger = _get_mlflow_logger(trainer)
+    with _mlflow_run_context(logger):
+        mlflow.log_image(
+            image,
+            artifact_file=f"{artifact_prefix}/epoch_{trainer.current_epoch:04d}.png",
+        )
+
+
+class UnconditionalSampleCallback(Callback):
+    def __init__(
+        self,
+        every_n_epochs: int = 5,
+        n_images: int = 64,
+        nrow: int = 8,
+        n_steps: int = 50,
+        ode_solver_name: str = "euler_solver",
+        sample_seed: int | None = 0,
+        artifact_prefix: str = "samples",
+    ) -> None:
+        self.every_n_epochs = int(every_n_epochs)
+        self.n_images = int(n_images)
+        self.nrow = int(nrow)
+        self.n_steps = int(n_steps)
+        self.ode_solver_name = ode_solver_name
+        self.sample_seed = sample_seed
+        self.artifact_prefix = artifact_prefix
+
+    def on_validation_epoch_end(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule
+    ) -> None:
+        if not trainer.is_global_zero or trainer.sanity_checking:
+            return
+        if self.every_n_epochs <= 0:
+            return
+        if (trainer.current_epoch + 1) % self.every_n_epochs != 0:
+            return
+
+        image_shape, sample_mean, sample_std = _get_sampling_metadata(trainer)
+        ode_solver = get_ode_solver_from_name(self.ode_solver_name)
+
+        was_training = pl_module.training
+        pl_module.eval()
+        with torch.no_grad():
+            samples = sample_unconditional(
+                model=pl_module.generator,
+                n_images=self.n_images,
+                image_shape=image_shape,
+                ode_solver=ode_solver,
+                n_steps=self.n_steps,
+                return_all=False,
+                device=pl_module.device,
+                seed=self.sample_seed,
+            )
+            image = create_pil_image(
+                samples,
+                nrow=self.nrow,
+                mean=sample_mean,
+                std=sample_std,
+            )
+
+        if was_training:
+            pl_module.train()
+
+        _log_sample_image(trainer, image, self.artifact_prefix)
+
+
+class ClassConditionalSampleCallback(Callback):
     def __init__(
         self,
         every_n_epochs: int = 5,
@@ -208,7 +351,9 @@ class FlowMatchingSampleCallback(Callback):
         self.sample_seed = sample_seed
         self.artifact_prefix = artifact_prefix
 
-    def on_validation_epoch_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+    def on_validation_epoch_end(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule
+    ) -> None:
         if not trainer.is_global_zero or trainer.sanity_checking:
             return
         if self.every_n_epochs <= 0:
@@ -216,72 +361,41 @@ class FlowMatchingSampleCallback(Callback):
         if (trainer.current_epoch + 1) % self.every_n_epochs != 0:
             return
 
-        datamodule = trainer.datamodule
-        if datamodule is None:
-            raise RuntimeError("FlowMatchingSampleCallback requires a datamodule with image_shape.")
-
-        image_shape = getattr(datamodule, "image_shape", None)
-        if image_shape is None:
-            raise RuntimeError("Datamodule must expose image_shape for sampling callbacks.")
-
-        sample_mean = getattr(datamodule, "sample_mean", None)
-        sample_std = getattr(datamodule, "sample_std", None)
+        image_shape, sample_mean, sample_std = _get_sampling_metadata(trainer)
         ode_solver = get_ode_solver_from_name(self.ode_solver_name)
+
+        num_classes = int(getattr(pl_module, "n_classes"))
+        labels = torch.arange(num_classes, device=pl_module.device)
+        repeats = max(1, -(-self.n_images // num_classes))
+        labels = labels.repeat(repeats)[: self.n_images]
 
         was_training = pl_module.training
         pl_module.eval()
         with torch.no_grad():
-            if getattr(pl_module, "is_conditional", False):
-                num_classes = int(getattr(pl_module, "n_classes"))
-                labels = torch.arange(num_classes, device=pl_module.device)
-                repeats = max(1, -(-self.n_images // num_classes))
-                labels = labels.repeat(repeats)[: self.n_images]
-                samples = sample_conditional(
-                    model=pl_module.generator,
-                    y=labels,
-                    image_shape=image_shape,
-                    ode_solver=ode_solver,
-                    n_steps=self.n_steps,
-                    guidance_scale=self.guidance_scale,
-                    null_id=getattr(pl_module, "null_id", None),
-                    return_all=False,
-                    device=pl_module.device,
-                    seed=self.sample_seed,
-                )
-                image = create_pil_image(
-                    samples,
-                    nrow=self.nrow,
-                    labels=labels,
-                    mean=sample_mean,
-                    std=sample_std,
-                )
-            else:
-                samples = sample_unconditional(
-                    model=pl_module.generator,
-                    n_images=self.n_images,
-                    image_shape=image_shape,
-                    ode_solver=ode_solver,
-                    n_steps=self.n_steps,
-                    return_all=False,
-                    device=pl_module.device,
-                    seed=self.sample_seed,
-                )
-                image = create_pil_image(
-                    samples,
-                    nrow=self.nrow,
-                    mean=sample_mean,
-                    std=sample_std,
-                )
+            samples = sample_conditional(
+                model=pl_module.generator,
+                y=labels,
+                image_shape=image_shape,
+                ode_solver=ode_solver,
+                n_steps=self.n_steps,
+                guidance_scale=self.guidance_scale,
+                null_id=getattr(pl_module, "null_id", None),
+                return_all=False,
+                device=pl_module.device,
+                seed=self.sample_seed,
+            )
+            image = create_pil_image(
+                samples,
+                nrow=self.nrow,
+                labels=labels,
+                mean=sample_mean,
+                std=sample_std,
+            )
 
         if was_training:
             pl_module.train()
 
-        logger = _get_mlflow_logger(trainer)
-        with _mlflow_run_context(logger):
-            mlflow.log_image(
-                image,
-                artifact_file=f"{self.artifact_prefix}/epoch_{trainer.current_epoch:04d}.png",
-            )
+        _log_sample_image(trainer, image, self.artifact_prefix)
 
 
 class MLFlowArtifactCallback(Callback):

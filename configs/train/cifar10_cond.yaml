@@ -15,10 +15,9 @@ model:
       max_time_period: 10000.0
       activation_name: silu
       upsample_mode: nearest
-    optim_cfg:
-      name: adamw
-      lr: 0.0003
-      weight_decay: 0.0001
+    optimizer_name: adamw
+    lr: 0.0003
+    weight_decay: 0.0001
     n_classes: 10
     d_cls_emb: 128
     null_id: 10
@@ -54,7 +53,7 @@ trainer:
         save_top_k: 1
         save_last: true
         auto_insert_metric_name: false
-    - class_path: models.lightning.FlowMatchingSampleCallback
+    - class_path: models.lightning.ClassConditionalSampleCallback
       init_args:
         every_n_epochs: 5
         n_images: 100

@@ -347,12 +347,12 @@ def train_loop_class_cond(
                     or sample_n_rows is None
                     or sample_image_shape is None
                 ):
-                    raise ValƒcƒueError(
+                    raise ValueError(
                         "sample_classes, sample_n_rows and sample_image_shape must be set when sample_every_epochs is enabled."
                     )
                 sample_steps = 50 if sample_ode_steps is None else sample_ode_steps
                 samples = sample_conditional(
-                    model=model,
+                    model=model,ß
                     y=torch.arange(0, sample_classes).repeat(sample_n_rows),
                     image_shape=sample_image_shape,
                     ode_solver=sample_ode_solver,

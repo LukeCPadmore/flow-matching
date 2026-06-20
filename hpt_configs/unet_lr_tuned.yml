@@ -41,7 +41,7 @@ unet:
 
 optim:
   fixed:
-    name: adamw
+    optimizer_name: adamw
   choices:
     lr:
       type: float

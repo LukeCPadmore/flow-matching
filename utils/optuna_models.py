@@ -3,7 +3,7 @@ from pathlib import Path
 
 from pydantic import BaseModel, Field, ConfigDict, model_validator
 import optuna
-from models.config import UNetConfig, OptimConfig
+from models.config import UNetConfig
 
 
 def log_pydantic_config_kv(cfg: BaseModel, logger, *, prefix: str = "cfg"):
@@ -120,7 +120,7 @@ class UNetHPT(BaseModel):
                 )
         return self
 
-    def sample(self, trial: optuna.Trial, *, prefix: str = "unet") -> OptimConfig:
+    def sample(self, trial: optuna.Trial, *, prefix: str = "unet") -> UNetConfig:
         resolved: Dict[str, Any] = dict(self.fixed)
         for k, spec in self.choices.items():
             resolved[k] = spec.sample(trial, f"{prefix}.{k}")
@@ -134,15 +134,15 @@ class OptimHPT(BaseModel):
 
     @model_validator(mode="after")
     def _validate(self):
-        if "name" in self.fixed and self.fixed["name"] not in ("adam", "adamw", "sgd"):
-            raise ValueError("optim.fixed.name must be adam|adamw|sgd")
+        if "optimizer_name" in self.fixed and self.fixed["optimizer_name"] not in ("adam", "adamw", "sgd"):
+            raise ValueError("optim.fixed.optimizer_name must be adam|adamw|sgd")
         return self
 
-    def sample(self, trial: optuna.Trial, *, prefix: str = "optim") -> OptimConfig:
+    def sample(self, trial: optuna.Trial, *, prefix: str = "optim") -> dict[str, Any]:
         resolved: Dict[str, Any] = dict(self.fixed)
         for k, spec in self.choices.items():
             resolved[k] = spec.sample(trial, f"{prefix}.{k}")
-        return OptimConfig(**resolved)
+        return resolved
 
 
 class OptunaStudyConfig(BaseModel):
@@ -173,7 +173,7 @@ class HPTYaml(BaseModel):
     unet: UNetHPT = Field(default_factory=UNetHPT)
     optim: OptimHPT = Field(default_factory=OptimHPT)
 
-    def sample(self, trial: optuna.Trial) -> tuple[UNetHPT, OptimHPT]:
+    def sample(self, trial: optuna.Trial) -> tuple[UNetHPT, dict[str, Any]]:
         return self.unet.sample(trial), self.optim.sample(trial)
 
     def log_config(self, logger) -> None:

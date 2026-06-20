@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, is_dataclass, fields, asdict
+from dataclasses import asdict, dataclass, fields, is_dataclass
 from typing import TYPE_CHECKING, Any, Literal, Mapping
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 import torch.nn as nn
-import torch.optim
 
 if TYPE_CHECKING:
     import optuna
 
 
-OptimName = Literal["adam", "adamw", "sgd"]
+OptimizerName = Literal["adam", "adamw", "sgd"]
 ActivationName = Literal["relu", "silu", "gelu"]
 UpsampleMode = Literal["nearest", "bilinear", "convtranspose"]
 
@@ -188,38 +187,49 @@ class UNetConfig:
         return dataclass_to_mlflow_params(self, prefix=prefix)
 
 
-@dataclass(frozen=True)
-class OptimConfig:
-    name: OptimName = "adamw"
-    lr: float = 3e-4
-    weight_decay: float = 1e-4
+def make_optimizer(
+    params,
+    *,
+    optimizer_name: OptimizerName = "adamw",
+    lr: float = 3e-4,
+    weight_decay: float = 1e-4,
+):
+    optimizer_name = optimizer_name.lower()
+    if optimizer_name == "adam":
+        import torch.optim
 
-    def make_optimizer(self, params):
-        if self.name == "adam":
-            return torch.optim.Adam(
-                params,
-                lr=self.lr,
-                weight_decay=self.weight_decay,
-            )
-        if self.name == "adamw":
-            return torch.optim.AdamW(
-                params,
-                lr=self.lr,
-                weight_decay=self.weight_decay,
-            )
-        if self.name == "sgd":
-            return torch.optim.SGD(
-                params,
-                lr=self.lr,
-                momentum=0.9,
-                weight_decay=self.weight_decay,
-            )
-        raise ValueError(f"Unknown optimiser {self.name}")
+        return torch.optim.Adam(
+            params,
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+    if optimizer_name == "adamw":
+        import torch.optim
 
-    def to_mlflow_params(self, *, prefix: str = "optim") -> dict[str, Any]:
-        return dataclass_to_mlflow_params(self, prefix=prefix)
+        return torch.optim.AdamW(
+            params,
+            lr=lr,
+            weight_decay=weight_decay,
+        )
+    if optimizer_name == "sgd":
+        import torch.optim
+
+        return torch.optim.SGD(
+            params,
+            lr=lr,
+            momentum=0.9,
+            weight_decay=weight_decay,
+        )
+    raise ValueError(f"Unknown optimiser {optimizer_name}")
 
 
-def log_config_kv(cfg: UNetConfig | OptimConfig, logger, *, prefix: str = "unet"):
-    for k, v in asdict(cfg).items():
+def log_config_kv(cfg: Any, logger, *, prefix: str = "unet"):
+    if is_dataclass(cfg):
+        items = asdict(cfg).items()
+    elif isinstance(cfg, Mapping):
+        items = cfg.items()
+    else:
+        raise TypeError(f"Expected dataclass or mapping, got {type(cfg)}")
+
+    for k, v in items:
         logger.info("%s.%s = %s", prefix, k, v)

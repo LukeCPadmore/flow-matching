@@ -61,13 +61,32 @@ class SimpleClassConditioning(nn.Module):
     def forward(self, cls_idx):
         cls_embedding = self.cond_emb(cls_idx)
         return self.mlp(cls_embedding)
-    
+
+
 class GreyScaleEncoder(nn.Module):
-    def __init__(self):
-        pass
-    
-    def forward(self):
-        pass
+    def __init__(
+        self,
+        d_trunk: int,
+        hidden_channels: int | None = None,
+        activation_cls: type[nn.Module] | None = None,
+    ):
+        super().__init__()
+        hidden_channels = int(hidden_channels or max(8, d_trunk))
+        act_cls = activation_cls if activation_cls is not None else nn.SiLU
+        self.encoder = nn.Sequential(
+            nn.Conv2d(1, hidden_channels, kernel_size=3, padding=1),
+            act_cls(),
+            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
+            act_cls(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(hidden_channels, d_trunk),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim == 3:
+            x = x.unsqueeze(1)
+        return self.encoder(x)
 
 
 def conv_gn_act(
@@ -441,7 +460,11 @@ class UNet(nn.Module):
         return x
 
     @classmethod
-    def from_config(cls, cfg: UNetConfig) -> "UNet":
+    def from_config(
+        cls,
+        cfg: UNetConfig,
+        conditioning_model: nn.Module | None = None,
+    ) -> "UNet":
         return cls(
             channels=list(cfg.channels),
             d_trunk=cfg.d_trunk,
@@ -453,6 +476,7 @@ class UNet(nn.Module):
             upsample_mode=cfg.upsample_mode,
             dropout_enc_dec_list=cfg.dropout_enc_dec_list,
             dropout_bottleneck=cfg.dropout_bottleneck,
+            conditioning_model=conditioning_model,
         )
 
 
@@ -477,3 +501,27 @@ class ClassCondUNet(nn.Module):
     def forward(self, x, t, y):
         cond_emb = self.class_cond(y)  # (B, d_trunk)
         return self.core(x, t, cond_emb)
+
+
+class SimpleColouriser(nn.Module):
+    def __init__(self, core: UNet):
+        super().__init__()
+        self.core = core
+
+    @classmethod
+    def from_config(
+        cls,
+        cfg: UNetConfig,
+        conditioning_model: nn.Module | None = None,
+    ) -> "SimpleColouriser":
+        if conditioning_model is None:
+            conditioning_model = GreyScaleEncoder(
+                cfg.d_trunk,
+                hidden_channels=cfg.base_channels,
+                activation_cls=cfg.activation_cls,
+            )
+        core = UNet.from_config(cfg, conditioning_model=conditioning_model)
+        return cls(core)
+
+    def forward(self, ab_t, L, t):
+        return self.core(ab_t, t, L)

@@ -5,7 +5,7 @@ import optuna
 import typer
 import yaml
 
-from models.config import log_config_kv
+from models.config import log_config_kv, make_optimizer
 from models.unet import UNet
 from utils.data_modules import MNISTDataModule
 from utils.logger_utils import trial_logger
@@ -40,9 +40,9 @@ def make_objective(
     mlflow.set_experiment(experiment_name)
 
     def objective(trial: optuna.Trial) -> float:
-        unet_cfg, optim_cfg = hpt.sample(trial)
+        unet_cfg, optim_params = hpt.sample(trial)
         model = UNet.from_config(unet_cfg).to(device)
-        optim = optim_cfg.make_optimizer(model.parameters())
+        optim = make_optimizer(model.parameters(), **optim_params)
 
         run_name = f"trial_{trial.number:04d}"
         with (
@@ -51,14 +51,14 @@ def make_objective(
         ):
             logger.info(f"Starting trial {trial.number}")
             log_config_kv(unet_cfg, logger, prefix="unet")
-            log_config_kv(optim_cfg, logger, prefix="optim")
+            log_config_kv(optim_params, logger, prefix="optim")
             # useful tags
             mlflow.set_tag("optuna.trial_number", trial.number)
             mlflow.set_tag("study_name", experiment_name)
 
             # log params
             mlflow.log_params(unet_cfg.to_mlflow_params(prefix="unet"))
-            mlflow.log_params(optim_cfg.to_mlflow_params(prefix="optim"))
+            mlflow.log_params({f"optim.{k}": v for k, v in optim_params.items()})
 
             def on_epoch(epoch, train_mse, val_mse):
                 logger.info(f"[epoch {epoch}] train_mse={train_mse:.6f}")
