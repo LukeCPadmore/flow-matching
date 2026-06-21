@@ -198,6 +198,52 @@ def sample_conditional(
     )
 
 
+def sample_colouriser_ab(
+    model,
+    L,
+    *,
+    ode_solver,
+    n_steps: int,
+    return_all: bool = False,
+    device=None,
+    seed: int | None = None,
+    clamp_mode: str | None = "clamp",
+    clamp_range: tuple[float, float] = (-1.0, 1.0),
+):
+    if L.ndim != 4 or L.shape[1] != 1:
+        raise ValueError(f"Expected L to have shape [B, 1, H, W], got {tuple(L.shape)}")
+
+    device = L.device if device is None else device
+    L = L.to(device)
+    batch_size, _, height, width = L.shape
+
+    g = None
+    if seed is not None:
+        g = torch.Generator(device=device).manual_seed(seed)
+
+    ab0 = torch.randn(
+        (batch_size, 2, height, width),
+        device=device,
+        dtype=L.dtype,
+        generator=g,
+    )
+
+    def f(ab, t_scalar: float):
+        t = torch.full((batch_size, 1, 1, 1), t_scalar, device=device, dtype=L.dtype)
+        return model(torch.cat([L, ab], dim=1), t)
+
+    xs, _ = ode_solver(f, ab0, 0.0, 1.0, n_steps)
+
+    if clamp_mode == "clamp":
+        xs = [x.clamp_(*clamp_range) for x in xs]
+    elif clamp_mode == "tanh":
+        xs = [torch.tanh(x) for x in xs]
+    elif clamp_mode is not None:
+        raise ValueError(f"Unknown clamp_mode: {clamp_mode}")
+
+    return xs if return_all else xs[-1]
+
+
 ODE_SOLVERS: dict[str, Callable] = {
     "euler_solver": euler_solver,
     "rk2_solver": rk2_solver,

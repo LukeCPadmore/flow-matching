@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from typing import Any
 
@@ -12,16 +13,21 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback
+from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.loggers import MLFlowLogger
+from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
 from src.flow_matching.models.config import UNetConfig, make_optimizer
 from src.flow_matching.models.ode_solvers import (
     get_ode_solver_from_name,
+    sample_colouriser_ab,
     sample_conditional,
     sample_unconditional,
 )
 from src.flow_matching.models.unet import ClassCondUNet, UNet, SimpleColouriser
 from src.flow_matching.utils.FID.fid_evaluation import build_fid_metric
 from src.flow_matching.utils.FID.fid_lightning import FIDClassifierLightningModule
+from src.flow_matching.utils.data_modules import lab_to_rgb
 from src.flow_matching.utils.train import (
     create_pil_image,
     flow_matching_step,
@@ -126,6 +132,120 @@ class BucketStats:
         self.freqs += other.freqs
 
 
+@dataclass
+class RunningABStats:
+    sum: torch.Tensor
+    sq_sum: torch.Tensor
+    min: torch.Tensor
+    max: torch.Tensor
+    count: int
+    true_ab_hist2d: torch.Tensor | None
+    pred_ab_hist2d: torch.Tensor | None
+    hist_bins: int
+    hist_low: float
+    hist_high: float
+
+    @classmethod
+    def zeros(
+        cls,
+        device: torch.device,
+        *,
+        hist_bins: int = 0,
+        hist_low: float = -1.0,
+        hist_high: float = 1.0,
+    ) -> "RunningABStats":
+        z = torch.zeros(2, device=device, dtype=torch.float64)
+        true_ab_hist2d = None
+        pred_ab_hist2d = None
+        if hist_bins > 0:
+            true_ab_hist2d = torch.zeros((hist_bins, hist_bins), dtype=torch.float64)
+            pred_ab_hist2d = torch.zeros((hist_bins, hist_bins), dtype=torch.float64)
+        return cls(
+            sum=z.clone(),
+            sq_sum=z.clone(),
+            min=torch.full((2,), float("inf"), device=device, dtype=torch.float64),
+            max=torch.full((2,), float("-inf"), device=device, dtype=torch.float64),
+            count=0,
+            true_ab_hist2d=true_ab_hist2d,
+            pred_ab_hist2d=pred_ab_hist2d,
+            hist_bins=hist_bins,
+            hist_low=hist_low,
+            hist_high=hist_high,
+        )
+
+    def update(self, ab: torch.Tensor, paired_ab: torch.Tensor | None = None) -> None:
+        ab = ab.detach().to(dtype=torch.float64)
+        self.sum += ab.sum(dim=(0, 2, 3))
+        self.sq_sum += (ab * ab).sum(dim=(0, 2, 3))
+        self.min = torch.minimum(self.min, ab.amin(dim=(0, 2, 3)))
+        self.max = torch.maximum(self.max, ab.amax(dim=(0, 2, 3)))
+        self.count += int(ab.shape[0] * ab.shape[2] * ab.shape[3])
+        if paired_ab is not None and self.true_ab_hist2d is not None:
+            self._update_ab_histogram(paired_ab, self.true_ab_hist2d)
+            self._update_ab_histogram(ab, self.pred_ab_hist2d)
+
+    def _update_ab_histogram(self, ab: torch.Tensor, hist2d: torch.Tensor | None) -> None:
+        if hist2d is None:
+            return
+        ab = ab.detach().to(dtype=torch.float64, device="cpu")
+        scale = (self.hist_bins - 1) / max(self.hist_high - self.hist_low, 1e-12)
+        a_idx = torch.clamp(
+            ((ab[:, 0] - self.hist_low) * scale).floor().to(torch.long),
+            0,
+            self.hist_bins - 1,
+        )
+        b_idx = torch.clamp(
+            ((ab[:, 1] - self.hist_low) * scale).floor().to(torch.long),
+            0,
+            self.hist_bins - 1,
+        )
+        bins = (b_idx * self.hist_bins + a_idx).reshape(-1)
+        counts = torch.bincount(bins, minlength=self.hist_bins * self.hist_bins).to(
+            dtype=torch.float64
+        )
+        hist2d += counts.view(self.hist_bins, self.hist_bins)
+
+    def mean(self) -> torch.Tensor:
+        safe_count = max(self.count, 1)
+        return self.sum / safe_count
+
+    def std(self) -> torch.Tensor:
+        safe_count = max(self.count, 1)
+        mean = self.mean()
+        var = self.sq_sum / safe_count - mean.square()
+        return var.clamp_min(0.0).sqrt()
+
+    def overall_mean(self) -> torch.Tensor:
+        safe_count = max(self.count * 2, 1)
+        return self.sum.sum() / safe_count
+
+    def overall_std(self) -> torch.Tensor:
+        safe_count = max(self.count * 2, 1)
+        overall_mean = self.overall_mean()
+        var = self.sq_sum.sum() / safe_count - overall_mean.square()
+        return var.clamp_min(0.0).sqrt()
+
+    def overall_min(self) -> torch.Tensor:
+        return self.min.min()
+
+    def overall_max(self) -> torch.Tensor:
+        return self.max.max()
+
+    def to_metrics(self, prefix: str) -> dict[str, torch.Tensor]:
+        mean = self.mean().to(dtype=torch.float32)
+        std = self.std().to(dtype=torch.float32)
+        return {
+            f"{prefix}_ab_min": self.overall_min().to(dtype=torch.float32),
+            f"{prefix}_ab_max": self.overall_max().to(dtype=torch.float32),
+            f"{prefix}_ab_mean": self.overall_mean().to(dtype=torch.float32),
+            f"{prefix}_ab_std": self.overall_std().to(dtype=torch.float32),
+            f"{prefix}_a_mean": mean[0],
+            f"{prefix}_a_std": std[0],
+            f"{prefix}_b_mean": mean[1],
+            f"{prefix}_b_std": std[1],
+        }
+
+
 def _flow_matching_step_uncond(model, x1, loss_fn, device):
     x1 = x1.to(device)
     batch_size = x1.size(0)
@@ -168,6 +288,102 @@ def _log_bucket_histograms(
             artifact_file=f"{artifact_prefix}/{name}_epoch_{epoch:04d}_step_{step:06d}.png",
         )
         plt.close(fig)
+
+
+def _log_colouriser_ab_histogram(
+    trainer: pl.Trainer, stats: RunningABStats, artifact_prefix: str
+) -> None:
+    if stats.true_ab_hist2d is None or stats.pred_ab_hist2d is None:
+        return
+
+    true_hist = stats.true_ab_hist2d.detach().cpu().to(dtype=torch.float32)
+    pred_hist = stats.pred_ab_hist2d.detach().cpu().to(dtype=torch.float32)
+    hist_bins = int(stats.hist_bins)
+    edges = np.linspace(stats.hist_low, stats.hist_high, hist_bins + 1)
+    centers = 0.5 * (edges[:-1] + edges[1:])
+    bin_width = float(edges[1] - edges[0]) if hist_bins > 0 else 1.0
+    extent = [stats.hist_low, stats.hist_high, stats.hist_low, stats.hist_high]
+    vmax = float(max(true_hist.max().item(), pred_hist.max().item(), 1.0))
+
+    fig = plt.figure(figsize=(15, 6))
+    outer = fig.add_gridspec(1, 3, width_ratios=[1.0, 1.0, 0.06], wspace=0.35)
+
+    image = None
+    panels = (
+        (outer[0, 0], true_hist, "true a vs b"),
+        (outer[0, 1], pred_hist, "pred a vs b"),
+    )
+    for outer_cell, hist2d, title in panels:
+        block = outer_cell.subgridspec(
+            2, 2, height_ratios=[1.0, 4.0], width_ratios=[4.0, 1.0], hspace=0.05, wspace=0.05
+        )
+        ax_top = fig.add_subplot(block[0, 0])
+        ax_joint = fig.add_subplot(block[1, 0], sharex=ax_top)
+        ax_side = fig.add_subplot(block[1, 1], sharey=ax_joint)
+
+        a_marginal = hist2d.sum(dim=0).numpy()
+        b_marginal = hist2d.sum(dim=1).numpy()
+
+        ax_top.bar(
+            centers,
+            a_marginal,
+            width=bin_width,
+            align="center",
+            color="#dddddd",
+            edgecolor="none",
+        )
+        ax_top.set_xlim(stats.hist_low, stats.hist_high)
+        ax_top.set_ylabel("count")
+        ax_top.tick_params(axis="x", labelbottom=False)
+        ax_top.set_title(title)
+
+        image = ax_joint.imshow(
+            hist2d.T,
+            origin="lower",
+            extent=extent,
+            aspect="equal",
+            cmap="magma",
+            vmin=0.0,
+            vmax=vmax,
+        )
+        ax_joint.plot(
+            [stats.hist_low, stats.hist_high],
+            [stats.hist_low, stats.hist_high],
+            color="white",
+            linestyle="--",
+            linewidth=1,
+        )
+        ax_joint.set_xlabel("a")
+        ax_joint.set_ylabel("b")
+
+        ax_side.barh(
+            centers,
+            b_marginal,
+            height=bin_width,
+            align="center",
+            color="#dddddd",
+            edgecolor="none",
+        )
+        ax_side.set_ylim(stats.hist_low, stats.hist_high)
+        ax_side.tick_params(axis="y", labelleft=False)
+        ax_side.set_xlabel("count")
+
+    cax = fig.add_subplot(outer[0, 2])
+    if image is not None:
+        fig.colorbar(image, cax=cax, label="count")
+
+    fig.suptitle(f"epoch {trainer.current_epoch:03d} colouriser ab distribution")
+    fig.tight_layout(rect=[0.0, 0.0, 1.0, 0.95])
+
+    fig.canvas.draw()
+    w, h = fig.canvas.get_width_height()
+    img = np.asarray(fig.canvas.buffer_rgba()).reshape(h, w, 4)
+    with _mlflow_run_context(trainer):
+        mlflow.log_image(
+            img,
+            artifact_file=f"{artifact_prefix}/epoch_{trainer.current_epoch:04d}.png",
+        )
+    plt.close(fig)
 
 
 class UnconditionalDebugCallback(Callback):
@@ -508,9 +724,40 @@ def _get_sampling_metadata(trainer: pl.Trainer) -> tuple[tuple[int, ...], Any, A
     return image_shape, sample_mean, sample_std
 
 
-def _log_sample_image(trainer: pl.Trainer, image, artifact_prefix: str) -> None:
+def _get_mlflow_logger(trainer: pl.Trainer) -> MLFlowLogger:
+    logger = trainer.logger
+    if isinstance(logger, MLFlowLogger):
+        return logger
+
+    if isinstance(logger, (list, tuple)):
+        for item in logger:
+            if isinstance(item, MLFlowLogger):
+                return item
+
+    raise RuntimeError("Expected trainer to be configured with an MLFlowLogger.")
+
+
+def _get_model_checkpoint_callback(trainer: pl.Trainer) -> ModelCheckpoint:
+    for callback in trainer.callbacks:
+        if isinstance(callback, ModelCheckpoint):
+            return callback
+    raise RuntimeError("Expected trainer to be configured with a ModelCheckpoint.")
+
+
+@contextmanager
+def _mlflow_run_context(trainer: pl.Trainer):
     logger = _get_mlflow_logger(trainer)
-    with _mlflow_run_context(logger):
+    active = mlflow.active_run()
+    if active is not None and active.info.run_id == logger.run_id:
+        yield
+        return
+
+    with mlflow.start_run(run_id=logger.run_id):
+        yield
+
+
+def _log_sample_image(trainer: pl.Trainer, image, artifact_prefix: str) -> None:
+    with _mlflow_run_context(trainer):
         mlflow.log_image(
             image,
             artifact_file=f"{artifact_prefix}/epoch_{trainer.current_epoch:04d}.png",
@@ -643,6 +890,192 @@ class ClassConditionalSampleCallback(Callback):
         _log_sample_image(trainer, image, self.artifact_prefix)
 
 
+class ColouriserLPIPSCallback(Callback):
+    def __init__(
+        self,
+        every_n_epochs: int = 5,
+        n_images: int = 64,
+        nrow: int = 8,
+        n_steps: int = 50,
+        ode_solver_name: str = "euler_solver",
+        clamp_mode: str = "clamp",
+        sample_seed: int | None = 0,
+    ) -> None:
+        self.every_n_epochs = int(every_n_epochs)
+        self.n_images = int(n_images)
+        self.nrow = int(nrow)
+        self.n_steps = int(n_steps)
+        self.ode_solver_name = ode_solver_name
+        self.sample_seed = sample_seed
+        self.clamp_mode = clamp_mode
+        self._lpips_metric: LearnedPerceptualImagePatchSimilarity | None = None
+        self._target_stats_logged = False
+
+    def on_fit_start(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
+        if trainer.datamodule is None:
+            raise RuntimeError("ColouriserLPIPSCallback requires a datamodule.")
+
+        try:
+            self._lpips_metric = LearnedPerceptualImagePatchSimilarity("vgg").to(
+                pl_module.device
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                "ColouriserLPIPSCallback requires LPIPS vgg weights to be available in the environment."
+            ) from exc
+
+    def on_validation_epoch_end(
+        self, trainer: pl.Trainer, pl_module: pl.LightningModule
+    ) -> None:
+        if not trainer.is_global_zero or trainer.sanity_checking:
+            return
+        if self.every_n_epochs <= 0:
+            return
+
+        if self._lpips_metric is None:
+            raise RuntimeError("ColouriserLPIPSCallback was not initialised correctly.")
+
+        datamodule = trainer.datamodule
+        if datamodule is None:
+            raise RuntimeError("ColouriserLPIPSCallback requires a datamodule.")
+
+        ode_solver = get_ode_solver_from_name(self.ode_solver_name)
+        loader = datamodule.val_dataloader()
+
+        self._lpips_metric = self._lpips_metric.to(pl_module.device)
+        self._lpips_metric.reset()
+
+        sample_count = 0
+        ab_mse_sum = 0.0
+        rgb_mse_sum = 0.0
+        pred_ab_stats = RunningABStats.zeros(pl_module.device, hist_bins=64)
+        target_ab_stats = RunningABStats.zeros(pl_module.device)
+        comparison_tiles: list[torch.Tensor] = []
+        was_training = pl_module.training
+        pl_module.eval()
+
+        with torch.no_grad():
+            for batch in loader:
+                LAB, _ = unpack_batch(batch)
+                LAB = LAB.to(pl_module.device)
+
+                take = min(LAB.shape[0], self.n_images - sample_count)
+                if take <= 0:
+                    break
+
+                LAB = LAB[:take]
+                L = LAB[:, :1, ...]
+                ab = LAB[:, 1:, ...]
+
+                ab_pred = sample_colouriser_ab(
+                    pl_module.generator,
+                    L,
+                    n_steps=self.n_steps,
+                    ode_solver=ode_solver,
+                    seed=self.sample_seed,
+                    device=pl_module.device,
+                    clamp_mode=self.clamp_mode,
+                )
+                pred_ab_stats.update(ab_pred, paired_ab=ab)
+                target_ab_stats.update(ab)
+
+                pred_lab = torch.cat([L, ab_pred.clamp(-1.0, 1.0)], dim=1)
+
+                gt_rgb = lab_to_rgb(LAB)
+                pred_rgb = lab_to_rgb(pred_lab)
+                self._lpips_metric.update(
+                    pred_rgb.mul(2.0).sub(1.0), gt_rgb.mul(2.0).sub(1.0)
+                )
+                comparison_tiles.append(
+                    torch.cat([L.repeat(1, 3, 1, 1), pred_rgb, gt_rgb], dim=-1)
+                )
+
+                batch_size = int(LAB.shape[0])
+                ab_mse_sum += float(F.mse_loss(ab_pred, ab).item()) * batch_size
+                rgb_mse_sum += float(F.mse_loss(pred_rgb, gt_rgb).item()) * batch_size
+                sample_count += batch_size
+
+        if was_training:
+            pl_module.train()
+
+        if sample_count <= 0:
+            raise RuntimeError("ColouriserLPIPSCallback found no validation samples.")
+
+        lpips = self._lpips_metric.compute()
+        ab_mse = torch.tensor(
+            ab_mse_sum / sample_count, device=pl_module.device, dtype=torch.float32
+        )
+        rgb_mse = torch.tensor(
+            rgb_mse_sum / sample_count, device=pl_module.device, dtype=torch.float32
+        )
+
+        pred_metrics = pred_ab_stats.to_metrics("val_pred")
+        target_metrics = target_ab_stats.to_metrics("val_target")
+
+        _log_colouriser_ab_histogram(trainer, pred_ab_stats, "colouriser/ab_hist")
+
+        if (trainer.current_epoch + 1) % self.every_n_epochs == 0 and comparison_tiles:
+            comparison_image = create_pil_image(
+                torch.cat(comparison_tiles, dim=0),
+                nrow=self.nrow,
+            )
+            _log_sample_image(trainer, comparison_image, "colouriser/comparisons")
+
+        pl_module.log(
+            "val_lpips",
+            lpips,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=True,
+            batch_size=sample_count,
+            sync_dist=False,
+        )
+        pl_module.log(
+            "val_rgb_mse",
+            rgb_mse,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            batch_size=sample_count,
+            sync_dist=False,
+        )
+        pl_module.log(
+            "val_ab_mse",
+            ab_mse,
+            on_step=False,
+            on_epoch=True,
+            prog_bar=False,
+            batch_size=sample_count,
+            sync_dist=False,
+        )
+
+        for name, value in pred_metrics.items():
+            pl_module.log(
+                name,
+                value,
+                on_step=False,
+                on_epoch=True,
+                prog_bar=False,
+                batch_size=sample_count,
+                sync_dist=False,
+            )
+
+        if not self._target_stats_logged:
+            for name, value in target_metrics.items():
+                pl_module.log(
+                    name,
+                    value,
+                    on_step=False,
+                    on_epoch=True,
+                    prog_bar=False,
+                    batch_size=sample_count,
+                    sync_dist=False,
+                )
+            self._target_stats_logged = True
+
+        self._lpips_metric.reset()
+
+
 class InputGridCallback(Callback):
     def __init__(
         self,
@@ -677,7 +1110,10 @@ class InputGridCallback(Callback):
             mean=sample_mean,
             std=sample_std,
         )
-        mlflow.log_image(image, artifact_file=f"{self.artifact_prefix}/train_start.png")
+        with _mlflow_run_context(trainer):
+            mlflow.log_image(
+                image, artifact_file=f"{self.artifact_prefix}/train_start.png"
+            )
 
 
 class FIDCallback(Callback):
@@ -764,34 +1200,45 @@ class FIDCallback(Callback):
         if was_training:
             pl_module.train()
 
-        mlflow.log_metric("fid", fid, step=trainer.current_epoch)
+        with _mlflow_run_context(trainer):
+            mlflow.log_metric("fid", fid, step=trainer.current_epoch)
 
 
 class MLFlowArtifactCallback(Callback):
-    def __init__(self, model_artifact_name: str, config_path: str) -> None:
+    def __init__(
+        self,
+        model_artifact_name: str,
+        config_path: str,
+        best_score_metric_name: str = "best_mse",
+    ) -> None:
         self.model_artifact_name = model_artifact_name
         self.config_path = config_path
+        self.best_score_metric_name = best_score_metric_name
 
     def on_fit_end(self, trainer: pl.Trainer, pl_module: pl.LightningModule) -> None:
         if not trainer.is_global_zero:
             return
 
-        checkpoint_callback = trainer.checkpoint_callback
-        best_model_path = getattr(checkpoint_callback, "best_model_path", "")
-        if best_model_path:
-            mlflow.log_artifact(best_model_path, artifact_path="checkpoints")
+        checkpoint_callback = _get_model_checkpoint_callback(trainer)
+        with _mlflow_run_context(trainer):
+            best_model_path = getattr(checkpoint_callback, "best_model_path", "")
+            if best_model_path:
+                mlflow.log_artifact(best_model_path, artifact_path="checkpoints")
 
-        last_model_path = getattr(checkpoint_callback, "last_model_path", "")
-        if last_model_path:
-            mlflow.log_artifact(last_model_path, artifact_path="checkpoints")
+            last_model_path = getattr(checkpoint_callback, "last_model_path", "")
+            if last_model_path:
+                mlflow.log_artifact(last_model_path, artifact_path="checkpoints")
 
-        mlflow.log_artifact(self.config_path, artifact_path="configs")
+            mlflow.log_artifact(self.config_path, artifact_path="configs")
 
-        best_score = getattr(checkpoint_callback, "best_model_score", None)
-        if best_score is not None:
-            mlflow.log_metric("best_mse", float(best_score.detach().cpu().item()))
+            best_score = getattr(checkpoint_callback, "best_model_score", None)
+            if best_score is not None:
+                mlflow.log_metric(
+                    self.best_score_metric_name,
+                    float(best_score.detach().cpu().item()),
+                )
 
-        mlflow.pytorch.log_model(
-            getattr(pl_module, "generator"),
-            artifact_path=self.model_artifact_name,
-        )
+            mlflow.pytorch.log_model(
+                getattr(pl_module, "generator"),
+                name=self.model_artifact_name,
+            )

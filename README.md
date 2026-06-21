@@ -1,16 +1,30 @@
-```bash
-mlflow ui --backend-store-uri sqlite:////home/luke-padmore/Source/flow-matching-mnist/mlflow.db --host 127.0.0.1 --port 5000
-export MLFLOW_TRACKING_URI="sqlite:////home/luke-padmore/Source/flow-matching-mnist/mlflow.db"
-
-export MLFLOW_TRACKING_URI="file:$(pwd)/mlruns"
-mlflow ui --backend-store-uri "file:$(pwd)/mlruns" --host 127.0.0.1 --port 5000
-
+Note to self: 
+To start mlflow & optuna servers, in ssh machine, run the following commands:
+```shell
+cd ~/ml-storage
+docker compose up -d
+```
+Then on local run the following command to forward the ports:
+```shell
+ssh -L 5000:localhost:5000 \
+  -L 5432:localhost:5432 \
+  -L 8080:localhost:8080 \
+  luke-padmore@luke-padmore-ml
 ```
 
 ## Training
+The training entrypoint uses LightningCLI, so run a config directly with `fit`:
+```shell
+python train.py fit --config configs/train/cifar10_colouriser.yaml
+```
 
-```bash
-python train.py fit --config configs/train/mnist_uncond.yaml
-python train.py fit --config configs/train/mnist_cond.yaml
-python train.py fit --config configs/train/cifar10_cond.yaml
+To launch a run in `tmux`, start the MLflow Docker Compose stack, and shut the machine down after it completes:
+```shell
+./run_and_shutdown.sh --config configs/train/cifar10_colouriser.yaml --shutdown
+```
+
+Useful variations:
+```shell
+./run_and_shutdown.sh --config configs/train/cifar10_colouriser_debug.yaml
+./run_and_shutdown.sh --config configs/train/mnist_uncond.yaml
 ```

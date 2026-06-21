@@ -37,7 +37,7 @@ trainer:
     init_args:
       experiment_name: Flow Matching MNIST Unconditional
       run_name: mnist_uncond
-      tracking_uri: file:mlruns
+      tracking_uri: http://localhost:5000
       save_dir: outputs/mlflow
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
