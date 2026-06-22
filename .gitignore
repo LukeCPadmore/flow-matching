@@ -2,9 +2,21 @@ data/
 mlruns/
 images/
 mlflow.db
-*.pyc
 optuna.db
 .env
 .venv/*
 mlartifacts/*
 checkpoints/*
+outputs/
+
+
+# Python cache files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Python package/build metadata
+*.egg-info/
+.eggs/
+build/
+dist/

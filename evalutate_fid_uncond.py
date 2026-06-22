@@ -5,17 +5,20 @@ import numpy as np
 import tempfile
 import os
 import json
+from pathlib import Path
 
-from utils.mlflow_tracking_utils import get_run_param, parse_int_list
-from utils.FID.fid_evaluation import evaluate_fid_with_registered_backbone
-from models.ode_solvers import get_ode_solver_from_name, sample_unconditional
+import yaml
+
+from src.flow_matching.utils.mlflow_tracking_utils import get_run_param, parse_int_list
+from src.flow_matching.utils.FID.fid_evaluation import evaluate_fid_with_lightning_backbone
+from src.flow_matching.utils.data_modules import MNISTDataModule
+from src.flow_matching.models.ode_solvers import get_ode_solver_from_name, sample_unconditional
 
 def run_eval(
     generator_run_id: str,
     generator_name = "UNet",
-    backbone_uri: str = "models:/fid_backbone/latest",
-    stats_filename: str = "real_stats.npz",
-    real_embeddings_filename: str = "real_embeddings.npz",
+    backbone_run_id: str | None = None,
+    backbone_artifact_path: str = "checkpoints/best.ckpt",
     n_samples: int = 5210,
     ode_solver_name: str | None = None,
     image_shape: list[int] | tuple[int, ...] | None = None,
@@ -27,9 +30,11 @@ def run_eval(
     real_loader=None,
     show_progress: bool = True):
 
-    if seed:
+    if seed is not None:
         torch.manual_seed(seed)
     device = torch.device(device if (device != "cuda" or torch.cuda.is_available()) else "cpu")
+    if not backbone_run_id:
+        raise ValueError("backbone_run_id is required")
 
     generator = mlflow.pytorch.load_model(f"runs:/{generator_run_id}/{generator_name}").to(device).eval()
     if ode_solver_name is None:
@@ -43,6 +48,16 @@ def run_eval(
         ode_steps = int(get_run_param(generator_run_id, "ode_steps"))
     if batch_size is None:
         batch_size = int(get_run_param(generator_run_id, "batch_size"))
+
+    if real_loader is None:
+        datamodule = MNISTDataModule(
+            batch_size=batch_size,
+            data_path=Path(get_run_param(generator_run_id, "data_path")),
+            num_workers=int(get_run_param(generator_run_id, "num_workers")),
+            transform=str(get_run_param(generator_run_id, "transform")),
+            shuffle=bool(yaml.safe_load(get_run_param(generator_run_id, "shuffle"))),
+        )
+        real_loader = datamodule.val_dataloader()
 
 
     sample_fn = partial(
@@ -59,12 +74,11 @@ def run_eval(
     mlflow.set_experiment("FM-uncond-eval")
     with mlflow.start_run(run_name = run_name):
 
-        fid, gen_embs, real_embs = evaluate_fid_with_registered_backbone(
+        fid, gen_embs, _ = evaluate_fid_with_lightning_backbone(
             sample_fn = sample_fn,
             device = device, 
-            backbone_uri=backbone_uri,
-            stats_filename=stats_filename,
-            real_embeddings_filename=real_embeddings_filename,
+            backbone_run_id=backbone_run_id,
+            backbone_artifact_path=backbone_artifact_path,
             n_samples = n_samples,
             batch_size=batch_size,
             real_loader=real_loader,
@@ -72,21 +86,16 @@ def run_eval(
         )
         mlflow.log_metric("fid", float(fid))
         mlflow.log_params({
-            "fid_backbone_uri": backbone_uri,
+            "fid_backbone_run_id": backbone_run_id,
+            "fid_backbone_artifact_path": backbone_artifact_path,
             "fid_n_samples": n_samples,
             "fid_batch_size": batch_size,
-            "fid_stats_filename": stats_filename,
             "seed": seed
         })
         with tempfile.TemporaryDirectory() as tmpdir:
             gen_path = os.path.join(tmpdir, "generated_embeddings.npz")
             np.savez(gen_path, embs=gen_embs)
             mlflow.log_artifact(gen_path)
-
-            if real_embs is not None:
-                real_path = os.path.join(tmpdir, "real_embeddings.npz")
-                np.savez(real_path, embs=real_embs)
-                mlflow.log_artifact(real_path)
 
             fid_path = os.path.join(tmpdir, "fid.json")
             with open(fid_path, "w", encoding="utf-8") as f:
@@ -96,8 +105,6 @@ def run_eval(
         if export_path is not None:
             os.makedirs(export_path, exist_ok=True)
             np.savez(os.path.join(export_path, "generated_embeddings.npz"), embs=gen_embs)
-            if real_embs is not None:
-                np.savez(os.path.join(export_path, "real_embeddings.npz"), embs=real_embs)
             with open(os.path.join(export_path, "fid_eval_fid.json"), "w", encoding="utf-8") as f:
                 json.dump({"fid": float(fid)}, f)
 

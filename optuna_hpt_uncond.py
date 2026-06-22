@@ -1,16 +1,16 @@
 from pathlib import Path
-import yaml
-import typer
 
 import mlflow
 import optuna
+import typer
+import yaml
 
-from utils.train import train_loop_uncond
-from models.unet import UNet
-from utils.create_dataloaders import create_mnist_train_val_loaders, build_transform
-from utils.logger_utils import trial_logger
-from utils.optuna_models import HPTYaml
-from models.config import log_config_kv
+from src.flow_matching.models.config import log_config_kv, make_optimizer
+from src.flow_matching.models.unet import UNet
+from src.utils.data_modules import MNISTDataModule
+from src.utils.logger_utils import trial_logger
+from src.utils.optuna_models import HPTYaml
+from src.utils.train import train_loop_uncond
 
 app = typer.Typer(no_args_is_help=True)
 
@@ -40,9 +40,9 @@ def make_objective(
     mlflow.set_experiment(experiment_name)
 
     def objective(trial: optuna.Trial) -> float:
-        unet_cfg, optim_cfg = hpt.sample(trial)
+        unet_cfg, optim_params = hpt.sample(trial)
         model = UNet.from_config(unet_cfg).to(device)
-        optim = optim_cfg.make_optimizer(model.parameters())
+        optim = make_optimizer(model.parameters(), **optim_params)
 
         run_name = f"trial_{trial.number:04d}"
         with (
@@ -51,14 +51,14 @@ def make_objective(
         ):
             logger.info(f"Starting trial {trial.number}")
             log_config_kv(unet_cfg, logger, prefix="unet")
-            log_config_kv(optim_cfg, logger, prefix="optim")
+            log_config_kv(optim_params, logger, prefix="optim")
             # useful tags
             mlflow.set_tag("optuna.trial_number", trial.number)
             mlflow.set_tag("study_name", experiment_name)
 
             # log params
             mlflow.log_params(unet_cfg.to_mlflow_params(prefix="unet"))
-            mlflow.log_params(optim_cfg.to_mlflow_params(prefix="optim"))
+            mlflow.log_params({f"optim.{k}": v for k, v in optim_params.items()})
 
             def on_epoch(epoch, train_mse, val_mse):
                 logger.info(f"[epoch {epoch}] train_mse={train_mse:.6f}")
@@ -117,14 +117,15 @@ def run(
 ):
     hpt = load_hpt_config(config)
 
-    # dataloaders from config (use your dl_cfg fields)
-    train_loader, val_loader = create_mnist_train_val_loaders(
+    datamodule = MNISTDataModule(
         batch_size=hpt.dl_cfg.batch_size,
         data_path=Path(hpt.dl_cfg.data_path),
         num_workers=hpt.dl_cfg.num_workers,
+        transform=hpt.dl_cfg.transform,
         shuffle=hpt.dl_cfg.shuffle,
-        transform=build_transform(hpt.dl_cfg.transform),
     )
+    train_loader = datamodule.train_dataloader()
+    val_loader = datamodule.val_dataloader()
 
     study = create_study_from_cfg(hpt)
 

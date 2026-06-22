@@ -1,0 +1,74 @@
+seed_everything: 42
+
+model:
+  class_path: src.flow_matching.models.lightning.ClassConditionalFlowMatchingModule
+  init_args:
+    unet_cfg:
+      in_channels: 1
+      base_channels: 32
+      mult: 2.0
+      n_layers: 3
+      d_trunk: 8
+      d_concat: 8
+      group_norm_size: 8
+      d_time: 128
+      max_time_period: 10000.0
+      activation_name: silu
+      upsample_mode: nearest
+    optimizer_name: adamw
+    lr: 0.001
+    weight_decay: 0.01
+    n_classes: 10
+    d_cls_emb: 128
+    null_id: 10
+    p_drop: 0.2
+
+data:
+  class_path: src.flow_matching.utils.data_modules.MNISTDataModule
+  init_args:
+    batch_size: 64
+    data_path: data
+    num_workers: 0
+    transform: default
+    shuffle: true
+
+trainer:
+  default_root_dir: outputs/mnist_cond
+  max_epochs: 50
+  log_every_n_steps: 20
+  logger:
+    class_path: lightning.pytorch.loggers.MLFlowLogger
+    init_args:
+      experiment_name: Flow Matching MNIST Conditional
+      run_name: mnist_cond
+      tracking_uri: http://localhost:5000
+      save_dir: outputs/mlflow
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: outputs/mnist_cond/checkpoints
+        filename: best
+        monitor: val_mse_epoch
+        mode: min
+        save_top_k: 1
+        save_last: true
+        auto_insert_metric_name: false
+    - class_path: src.flow_matching.models.lightning.ClassConditionalSampleCallback
+      init_args:
+        every_n_epochs: 5
+        n_images: 100
+        nrow: 10
+        n_steps: 50
+        guidance_scale: 1.0
+        ode_solver_name: euler_solver
+        sample_seed: 42
+        artifact_prefix: samples/mnist_cond
+    - class_path: src.flow_matching.models.lightning.InputGridCallback
+      init_args:
+        n_images: 64
+        nrow: 8
+        artifact_prefix: inputs/mnist_cond
+    - class_path: src.flow_matching.models.lightning.MLFlowArtifactCallback
+      init_args:
+        model_artifact_name: ClassCondUNet
+        config_path: configs/train/mnist_cond.yaml
