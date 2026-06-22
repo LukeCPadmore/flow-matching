@@ -9,3 +9,4 @@ optuna.db
 mlartifacts/*
 checkpoints/*
 outputs/
+__pycache__/*
