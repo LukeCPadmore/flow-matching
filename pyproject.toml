@@ -19,6 +19,7 @@ dependencies = [
 [dependency-groups]
 dev = [
     "ipykernel>=7.3.0",
+    "onnxruntime"
 ]
 
 [build-system]
