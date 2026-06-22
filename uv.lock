@@ -746,7 +746,6 @@ dependencies = [
     { name = "numpy" },
     { name = "pillow" },
     { name = "pyyaml" },
-    { name = "torch" },
 ]
 
 [package.optional-dependencies]
@@ -760,6 +759,7 @@ train = [
     { name = "mlflow" },
     { name = "optuna" },
     { name = "scikit-image" },
+    { name = "torch" },
     { name = "torchvision" },
 ]
 
@@ -780,7 +780,7 @@ requires-dist = [
     { name = "pillow", specifier = ">=10.0.0" },
     { name = "pyyaml", specifier = ">=6.0.3" },
     { name = "scikit-image", marker = "extra == 'train'", specifier = ">=0.26.0" },
-    { name = "torch", specifier = ">=2.12.0" },
+    { name = "torch", marker = "extra == 'train'", specifier = ">=2.12.0" },
     { name = "torchvision", marker = "extra == 'train'", specifier = ">=0.27.0" },
 ]
 provides-extras = ["serve", "train"]
