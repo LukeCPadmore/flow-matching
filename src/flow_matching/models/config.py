@@ -3,11 +3,10 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, fields, is_dataclass
 from typing import TYPE_CHECKING, Any, Literal, Mapping
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
 import torch.nn as nn
 
 if TYPE_CHECKING:
-    import optuna
+    pass
 
 
 OptimizerName = Literal["adam", "adamw", "sgd"]
