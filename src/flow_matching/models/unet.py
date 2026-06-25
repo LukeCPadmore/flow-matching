@@ -27,7 +27,6 @@ class SinusoidalTimeEmbedding(nn.Module):
 
     def _sinusoidal_time_embedding(self, t: torch.Tensor) -> torch.Tensor:
         t = t.squeeze()
-        B = t.shape[0]
         half = self.embedding_dim // 2
 
         i = torch.arange(half, device=t.device, dtype=torch.float32)

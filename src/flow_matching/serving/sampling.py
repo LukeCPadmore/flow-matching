@@ -4,12 +4,12 @@ from typing import Callable
 
 import numpy as np
 
-Array = np.ndarray
+# Numpy copies of ODE solvers to make serving container more lightweight.
 
 
 def euler_solver(
-    f: Callable[[Array, float], Array],
-    x0: Array,
+    f: Callable[[np.ndarray, float], np.ndarray],
+    x0: np.ndarray,
     t0: float,
     t1: float,
     n_steps: int,
@@ -28,8 +28,8 @@ def euler_solver(
 
 
 def rk4_solver(
-    f: Callable[[Array, float], Array],
-    x0: Array,
+    f: Callable[[np.ndarray, float], np.ndarray],
+    x0: np.ndarray,
     t0: float,
     t1: float,
     n_steps: int,
@@ -75,7 +75,7 @@ def sample_colouriser_ab(
     rng = np.random.default_rng(seed)
     ab0 = rng.standard_normal((batch_size, 2, height, width), dtype=np.float32)
 
-    def f(ab: Array, t_scalar: float) -> Array:
+    def f(ab: np.ndarray, t_scalar: float) -> np.ndarray:
         t = np.full((batch_size, 1, 1, 1), t_scalar, dtype=np.float32)
         LAB_t = np.concatenate([L, ab], axis=1)
         return model(LAB_t, t)
