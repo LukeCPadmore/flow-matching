@@ -46,3 +46,6 @@ trainer:
     - class_path: src.flow_matching.utils.FID.fid_lightning.FIDCheckpointArtifactCallback
       init_args:
         artifact_path: checkpoints
+    - class_path: src.flow_matching.models.lightning.EMAWeightAveraging
+      init_args:
+        decay: 0.999

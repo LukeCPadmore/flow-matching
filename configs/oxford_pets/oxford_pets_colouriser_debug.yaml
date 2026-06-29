@@ -1,0 +1,43 @@
+seed_everything: 101
+
+model:
+  class_path: src.flow_matching.models.lightning.SimpleColouriserFlowMatchingModule
+  init_args:
+    unet_cfg:
+      in_channels: 3
+      out_channels: 2
+      base_channels: 32
+      mult: 2.0
+      n_layers: 4
+      d_trunk: 32
+      group_norm_size: 8
+      d_time: 128
+      max_time_period: 10000.0
+      activation_name: silu
+      upsample_mode: nearest
+    optimizer_name: adamw
+    lr: 0.0003
+    weight_decay: 0.0001
+    p_drop: 0.1
+
+data:
+  class_path: src.flow_matching.utils.data_modules.OxfordPetsColouriserDataModule
+  init_args:
+    batch_size: 32
+    data_path: data
+    num_workers: 2
+    transform: LAB
+    shuffle: true
+    drop_labels: true
+
+trainer:
+  default_root_dir: outputs/oxford_pets_colouriser
+  profiler:
+    init_args:
+      dirpath: outputs/profiler
+      filename: oxford_pets_colouriser
+      record_module_names: true
+      group_by_input_shapes: true
+      profiler: simple
+  limit_train_batches: 1
+  limit_val_batches: 0

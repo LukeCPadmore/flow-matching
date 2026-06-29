@@ -3,7 +3,7 @@ import torch.nn as nn
 from PIL import ImageDraw
 from torchvision.utils import make_grid
 from torchvision.transforms.functional import to_pil_image
-from src.flow_matching.models.ode_solvers import (
+from flow_matching.models.ode_solvers import (
     euler_solver,
     sample_conditional,
     sample_unconditional,

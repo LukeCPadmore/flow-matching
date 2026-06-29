@@ -55,7 +55,6 @@ class UNetConfig:
     mult: float = 2  # e.g. 16 -> 32 in next layer with
     n_layers: int = 3
     d_trunk: int = 32
-    d_concat: int = 8
     group_norm_size: int = 8
 
     # Linear increaseing dropout in enconder, max dropout in bottleneck and linearly decreasing dropout in decoder
@@ -167,17 +166,11 @@ class UNetConfig:
         g = self.group_norm_size
         chans = self.channels
 
-        for level in range(1, len(chans)):
-            in_ch = chans[level]
-            out_ch = chans[level]  # or whatever you set for that block
+        if len(chans) < 2:
+            raise ValueError("UNetConfig requires at least one hidden channel")
 
-            UNetConfig._check_groupnorm(
-                in_ch + self.d_concat, g, f"downblock preconv level {level}"
-            )
-            UNetConfig._check_groupnorm(
-                2 * in_ch + self.d_concat, g, f"upblock preconv level {level}"
-            )
-            UNetConfig._check_groupnorm(out_ch, g, f"postconv level {level}")
+        for level, c in enumerate(chans[1:], start=1):
+            UNetConfig._check_groupnorm(c, g, f"channel level {level}")
 
         UNetConfig._check_dropout(
             self.dropout_enc_dec_min, self.dropout_enc_dec_max, self.dropout_bottleneck

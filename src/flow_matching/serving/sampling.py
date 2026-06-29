@@ -13,18 +13,25 @@ def euler_solver(
     t0: float,
     t1: float,
     n_steps: int,
+    return_all: bool = True,
 ):
     """Simple Euler integrator for numpy arrays."""
     h = (t1 - t0) / n_steps
     x = np.array(x0, copy=True)
-    xs, ts = [], []
-    for k in range(n_steps + 1):
+    if return_all:
+        xs, ts = [], []
+        for k in range(n_steps + 1):
+            t = t0 + k * h
+            ts.append(t)
+            xs.append(x.copy())
+            if k < n_steps:
+                x = x + h * f(x, t)
+        return xs, ts
+
+    for k in range(n_steps):
         t = t0 + k * h
-        ts.append(t)
-        xs.append(x.copy())
-        if k < n_steps:
-            x = x + h * f(x, t)
-    return xs, ts
+        x = x + h * f(x, t)
+    return x, None
 
 
 def rk4_solver(
@@ -33,6 +40,7 @@ def rk4_solver(
     t0: float,
     t1: float,
     n_steps: int,
+    return_all: bool = True,
 ):
     """Classical RK4 integrator for numpy arrays."""
     if n_steps < 1:
@@ -40,18 +48,28 @@ def rk4_solver(
 
     h = (t1 - t0) / n_steps
     x = np.array(x0, copy=True)
-    xs, ts = [], []
-    for k in range(n_steps + 1):
+    if return_all:
+        xs, ts = [], []
+        for k in range(n_steps + 1):
+            t = t0 + k * h
+            ts.append(t)
+            xs.append(x.copy())
+            if k < n_steps:
+                k1 = f(x, t)
+                k2 = f(x + 0.5 * h * k1, t + 0.5 * h)
+                k3 = f(x + 0.5 * h * k2, t + 0.5 * h)
+                k4 = f(x + h * k3, t + h)
+                x = x + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+        return xs, ts
+
+    for k in range(n_steps):
         t = t0 + k * h
-        ts.append(t)
-        xs.append(x.copy())
-        if k < n_steps:
-            k1 = f(x, t)
-            k2 = f(x + 0.5 * h * k1, t + 0.5 * h)
-            k3 = f(x + 0.5 * h * k2, t + 0.5 * h)
-            k4 = f(x + h * k3, t + h)
-            x = x + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-    return xs, ts
+        k1 = f(x, t)
+        k2 = f(x + 0.5 * h * k1, t + 0.5 * h)
+        k3 = f(x + 0.5 * h * k2, t + 0.5 * h)
+        k4 = f(x + h * k3, t + h)
+        x = x + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+    return x, None
 
 
 def sample_colouriser_ab(
@@ -60,6 +78,7 @@ def sample_colouriser_ab(
     *,
     ode_solver,
     n_steps: int,
+    guidance_scale: float = 1.0,
     return_all: bool = False,
     seed: int | None = None,
     clamp_mode: str | None = "clamp",
@@ -77,16 +96,32 @@ def sample_colouriser_ab(
 
     def f(ab: np.ndarray, t_scalar: float) -> np.ndarray:
         t = np.full((batch_size, 1, 1, 1), t_scalar, dtype=np.float32)
-        LAB_t = np.concatenate([L, ab], axis=1)
-        return model(LAB_t, t)
+        if guidance_scale == 1.0:
+            return model(ab, t, L)
 
-    xs, _ = ode_solver(f, ab0, 0.0, 1.0, n_steps)
+        ab2 = np.concatenate([ab, ab], axis=0)
+        t2 = np.concatenate([t, t], axis=0)
+        L2 = np.concatenate([L, np.zeros_like(L)], axis=0)
+        v2 = model(ab2, t2, L2)
+        v_cond, v_uncond = np.split(v2, 2, axis=0)
+        return v_uncond + guidance_scale * (v_cond - v_uncond)
 
+    xs, _ = ode_solver(f, ab0, 0.0, 1.0, n_steps, return_all=return_all)
+
+    if return_all:
+        if clamp_mode == "clamp":
+            xs = [np.clip(x, clamp_range[0], clamp_range[1]) for x in xs]
+        elif clamp_mode == "tanh":
+            xs = [np.tanh(x) for x in xs]
+        elif clamp_mode is not None:
+            raise ValueError(f"Unknown clamp_mode: {clamp_mode}")
+        return xs
+
+    x = xs
     if clamp_mode == "clamp":
-        xs = [np.clip(x, clamp_range[0], clamp_range[1]) for x in xs]
+        x = np.clip(x, clamp_range[0], clamp_range[1])
     elif clamp_mode == "tanh":
-        xs = [np.tanh(x) for x in xs]
+        x = np.tanh(x)
     elif clamp_mode is not None:
         raise ValueError(f"Unknown clamp_mode: {clamp_mode}")
-
-    return xs if return_all else xs[-1]
+    return x

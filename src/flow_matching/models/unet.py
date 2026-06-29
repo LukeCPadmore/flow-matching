@@ -1,7 +1,9 @@
+import math
+from dataclasses import replace
+
 import torch
 import torch.nn as nn
-import math
-from src.flow_matching.models.config import UNetConfig
+from flow_matching.models.config import UNetConfig
 
 
 class SinusoidalTimeEmbedding(nn.Module):
@@ -26,7 +28,7 @@ class SinusoidalTimeEmbedding(nn.Module):
         )
 
     def _sinusoidal_time_embedding(self, t: torch.Tensor) -> torch.Tensor:
-        t = t.squeeze()
+        t = t.reshape(-1)
         half = self.embedding_dim // 2
 
         i = torch.arange(half, device=t.device, dtype=torch.float32)
@@ -38,6 +40,28 @@ class SinusoidalTimeEmbedding(nn.Module):
 
     def forward(self, t: torch.Tensor) -> torch.Tensor:
         return self.mlp(self._sinusoidal_time_embedding(t))
+
+
+class TimeFiLM(nn.Module):
+    def __init__(self, in_dim, out_dim):
+        super().__init__()
+        self.mlp = nn.Linear(in_dim, out_dim * 2)
+
+    def forward(self, x, t_emb):
+        gamma, beta = self.mlp(t_emb).chunk(2, -1)
+        gamma = gamma[:, :, None, None]
+        beta = beta[:, :, None, None]
+        return (1 + gamma) * x + beta
+
+
+class SpacialFiLM(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super().__init__()
+        self.conv = nn.Conv2d(in_channels, out_channels * 2, kernel_size=1)
+
+    def forward(self, x, cond):
+        gamma, beta = self.conv(cond).chunk(2, 1)
+        return (1 + gamma) * x + beta
 
 
 class SimpleClassConditioning(nn.Module):
@@ -60,32 +84,6 @@ class SimpleClassConditioning(nn.Module):
     def forward(self, cls_idx):
         cls_embedding = self.cond_emb(cls_idx)
         return self.mlp(cls_embedding)
-
-
-class GreyScaleEncoder(nn.Module):
-    def __init__(
-        self,
-        d_trunk: int,
-        hidden_channels: int | None = None,
-        activation_cls: type[nn.Module] | None = None,
-    ):
-        super().__init__()
-        hidden_channels = int(hidden_channels or max(8, d_trunk))
-        act_cls = activation_cls if activation_cls is not None else nn.SiLU
-        self.encoder = nn.Sequential(
-            nn.Conv2d(1, hidden_channels, kernel_size=3, padding=1),
-            act_cls(),
-            nn.Conv2d(hidden_channels, hidden_channels, kernel_size=3, padding=1),
-            act_cls(),
-            nn.AdaptiveAvgPool2d(1),
-            nn.Flatten(),
-            nn.Linear(hidden_channels, d_trunk),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if x.ndim == 3:
-            x = x.unsqueeze(1)
-        return self.encoder(x)
 
 
 def conv_gn_act(
@@ -142,14 +140,71 @@ def two_conv_block(
     return nn.Sequential(*layers)
 
 
+class ResnetBlock(nn.Module):
+    def __init__(
+        self,
+        in_channels,
+        out_channels,
+        group_norm_size=8,
+        d_trunk: int | None = None,
+        spatial_cond_channels: int | None = None,
+        activation_cls: type[nn.Module] | None = None,
+        p_drop=0,
+    ):
+        super().__init__()
+
+        self.group_norm_size = group_norm_size
+        act_cls = activation_cls if activation_cls is not None else nn.SiLU
+        self.conv = two_conv_block(
+            in_ch=in_channels,
+            mid_ch=out_channels,
+            out_ch=out_channels,
+            groups=group_norm_size,
+            act_cls=act_cls,
+            p_drop=p_drop,
+        )
+        self.res_proj = (
+            nn.Identity()
+            if in_channels == out_channels
+            else nn.Conv2d(in_channels, out_channels, 1, bias=False)
+        )
+        self.time_film = TimeFiLM(d_trunk, out_channels) if d_trunk is not None else None
+        self.spatial_film = (
+            SpacialFiLM(spatial_cond_channels, out_channels)
+            if spatial_cond_channels is not None
+            else None
+        )
+
+    def forward(
+        self,
+        x,
+        time_emb: torch.Tensor | None = None,
+        spatial_cond: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x_orig = x
+        x = self.conv(x)
+        x = x + self.res_proj(x_orig)
+        if self.spatial_film is not None:
+            if spatial_cond is None:
+                raise ValueError(
+                    "spatial_cond is required when spatial conditioning is enabled"
+                )
+            x = self.spatial_film(x, spatial_cond)
+        if self.time_film is not None:
+            if time_emb is None:
+                raise ValueError("time_emb is required when d_trunk is set")
+            x = self.time_film(x, time_emb)
+        return x
+
+
 class ConvDownblock(nn.Module):
     def __init__(
         self,
         in_channels,
         out_channels,
-        d_trunk,
-        d_concat,
+        d_trunk: int | None,
         group_norm_size=8,
+        spatial_cond_channels: int | None = None,
         activation_cls: type[nn.Module] | None = None,
         p_drop=0,
     ):
@@ -157,16 +212,16 @@ class ConvDownblock(nn.Module):
         Deciding to use stride in order to downsample instead of maxpooling
         """
         super().__init__()
-        self.d_concat = d_concat
         self.group_norm_size = group_norm_size
         act_cls = activation_cls if activation_cls is not None else nn.SiLU
 
-        self.conv = two_conv_block(
-            in_ch=in_channels + d_concat,
-            mid_ch=out_channels,
-            out_ch=out_channels,
-            groups=group_norm_size,
-            act_cls=act_cls,
+        self.res_block = ResnetBlock(
+            in_channels,
+            out_channels,
+            group_norm_size=group_norm_size,
+            d_trunk=d_trunk,
+            spatial_cond_channels=spatial_cond_channels,
+            activation_cls=activation_cls,
             p_drop=p_drop,
         )
 
@@ -181,17 +236,16 @@ class ConvDownblock(nn.Module):
                 p_drop=p_drop,
             )
         )
-        self.emb_mlp = nn.Linear(d_trunk, d_concat)
 
-    def forward(self, x: torch.Tensor, trunk_emb: torch.Tensor) -> torch.Tensor:
-        """
-        Project trunk embedding to d_concat, expand spatially, then concat.
-        """
-        emb = self.emb_mlp(trunk_emb)[:, :, None, None]
-        emb = emb.expand(-1, -1, x.size(-2), x.size(-1))
-        x = torch.cat([x, emb], dim=1)
-        x_skip_features = self.conv(x)
-        x = self.down(x_skip_features)
+    def forward(
+        self,
+        x: torch.Tensor,
+        time_emb: torch.Tensor | None = None,
+        spatial_cond: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = self.res_block(x, time_emb, spatial_cond=spatial_cond)
+        x_skip_features = x
+        x = self.down(x)
         return x, x_skip_features
 
 
@@ -200,58 +254,52 @@ class ConvUpblock(nn.Module):
         self,
         in_channels,
         out_channels,
-        d_trunk,
-        d_concat,
+        d_trunk: int | None,
         group_norm_size=8,
+        spatial_cond_channels: int | None = None,
         upsample_mode="nearest",
         activation_cls: type[nn.Module] | None = None,
         p_drop=0,
     ):
         """
-        Note input will be sized (B, 2 * in_channels + d_concat, H, W)
+        Note input will be sized (B, 2 * in_channels, H, W)
         Channels:
         1 x input channels for residual features
         1 x input channels for x
-        1 x d_concat for broadcast trunk embeddings
         """
         super().__init__()
-        self.d_concat = d_concat
         self.group_norm_size = group_norm_size
         self.upsampler = UNetConfig.make_upsample(upsample_mode, in_channels)
-        act_cls = activation_cls if activation_cls else nn.SiLU
-        self.conv = two_conv_block(
-            in_ch=2 * in_channels + d_concat,
-            mid_ch=out_channels,
-            out_ch=out_channels,
-            groups=group_norm_size,
-            act_cls=act_cls,
+
+        self.res_block = ResnetBlock(
+            2 * in_channels,
+            out_channels,
+            group_norm_size=group_norm_size,
+            d_trunk=d_trunk,
+            spatial_cond_channels=spatial_cond_channels,
+            activation_cls=activation_cls,
             p_drop=p_drop,
         )
-        self.emb_mlp = nn.Linear(d_trunk, d_concat)
 
     def forward(
         self,
         x: torch.Tensor,
-        trunk_emb: torch.Tensor,
         skip_features: torch.Tensor,
+        time_emb: torch.Tensor | None = None,
+        spatial_cond: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        """
-        Project trunk embedding to d_concat, expand spatially, then concat.
-        """
         x = self.upsampler(x)
-        emb = self.emb_mlp(trunk_emb)[:, :, None, None]
-        emb = emb.expand(-1, -1, x.size(-2), x.size(-1))
-        x = torch.cat([x, skip_features, emb], dim=1)
-        return self.conv(x)
+        x = torch.cat([x, skip_features], dim=1)
+        return self.res_block(x, time_emb, spatial_cond=spatial_cond)
 
 
 class Encoder(nn.Module):
     def __init__(
         self,
         channels: list[int],
-        d_trunk,
-        d_concat,
+        d_trunk: int | None,
         group_norm_size=8,
+        spatial_cond_channels: list[int] | None = None,
         activation_cls: type[nn.Module] | None = None,
         dropout_enc_list=None,
     ):
@@ -269,6 +317,11 @@ class Encoder(nn.Module):
             stride=1,
         )
         dropout_enc_list = dropout_enc_list or [0] * (len(self.channels) - 1)
+        spatial_cond_channels = spatial_cond_channels or [None] * (len(self.channels) - 1)
+        if len(spatial_cond_channels) != len(self.channels) - 1:
+            raise ValueError(
+                "spatial_cond_channels must match the number of encoder down blocks"
+            )
         self.channels[0] = self.channels[1]
         self.down_blocks = nn.ModuleList(
             [
@@ -276,25 +329,35 @@ class Encoder(nn.Module):
                     in_channels,
                     out_channels,
                     d_trunk,
-                    d_concat,
                     group_norm_size=group_norm_size,
+                    spatial_cond_channels=spatial_cond_ch,
                     activation_cls=activation_cls,
                     p_drop=p_drop,
                 )
-                for in_channels, out_channels, p_drop in zip(
-                    self.channels[:-1], self.channels[1:], dropout_enc_list
+                for in_channels, out_channels, p_drop, spatial_cond_ch in zip(
+                    self.channels[:-1],
+                    self.channels[1:],
+                    dropout_enc_list,
+                    spatial_cond_channels,
                 )
             ]
         )
 
-    def forward(self, x, trunk_emb):
+    def forward(
+        self,
+        x,
+        trunk_emb: torch.Tensor | None = None,
+        spatial_cond: list[torch.Tensor] | None = None,
+    ):
         """
         Loop through downblocks and save output tensors to skip_features to later pass to decoder
         """
         skip_features = []
         x = self.initial_conv(x)
-        for block in self.down_blocks:
-            x, x_skip_features = block(x, trunk_emb)
+        spatial_cond = list(spatial_cond) if spatial_cond is not None else None
+        for idx, block in enumerate(self.down_blocks):
+            spatial = spatial_cond[idx] if spatial_cond is not None else None
+            x, x_skip_features = block(x, trunk_emb, spatial_cond=spatial)
             skip_features.append(x_skip_features)
         return x, skip_features
 
@@ -303,9 +366,9 @@ class Decoder(nn.Module):
     def __init__(
         self,
         channels: list[int],
-        d_trunk,
-        d_concat,
+        d_trunk: int | None,
         group_norm_size=8,
+        spatial_cond_channels: list[int] | None = None,
         upsample_mode="nearest",
         activation_cls: type[nn.Module] | None = None,
         dropout_dec_list=None,
@@ -321,20 +384,31 @@ class Decoder(nn.Module):
         self.channels = chls[::-1]
         self.channels.append(self.channels[-1])
         dropout_dec_list = dropout_dec_list or [0] * (len(self.channels) - 1)
+        spatial_cond_channels = spatial_cond_channels or [None] * (
+            len(self.channels) - 1
+        )
+        if len(spatial_cond_channels) != len(self.channels) - 1:
+            raise ValueError(
+                "spatial_cond_channels must match the number of decoder up blocks"
+            )
+        spatial_cond_channels = list(spatial_cond_channels)[::-1]
         self.up_blocks = nn.ModuleList(
             [
                 ConvUpblock(
                     in_channels,
                     out_channels,
                     d_trunk,
-                    d_concat,
                     group_norm_size=group_norm_size,
+                    spatial_cond_channels=spatial_cond_ch,
                     upsample_mode=upsample_mode,
                     activation_cls=activation_cls,
                     p_drop=p_drop,
                 )
-                for in_channels, out_channels, p_drop in zip(
-                    self.channels[:-1], self.channels[1:], dropout_dec_list
+                for in_channels, out_channels, p_drop, spatial_cond_ch in zip(
+                    self.channels[:-1],
+                    self.channels[1:],
+                    dropout_dec_list,
+                    spatial_cond_channels,
                 )
             ]
         )
@@ -343,10 +417,16 @@ class Decoder(nn.Module):
         )
 
     def forward(
-        self, x, trunk_emb: torch.Tensor, skip_features: list[torch.Tensor]
+        self,
+        x,
+        trunk_emb: torch.Tensor | None,
+        skip_features: list[torch.Tensor],
+        spatial_cond: list[torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        spatial_cond = list(spatial_cond) if spatial_cond is not None else None
         for block in self.up_blocks:
-            x = block(x, trunk_emb, skip_features.pop())
+            spatial = spatial_cond.pop() if spatial_cond is not None else None
+            x = block(x, skip_features.pop(), trunk_emb, spatial_cond=spatial)
         return self.final_conv(x)
 
 
@@ -354,39 +434,68 @@ class Bottleneck(nn.Module):
     def __init__(
         self,
         channels,
-        d_trunk,
-        d_concat,
+        d_trunk: int | None,
         group_norm_size=8,
+        spatial_cond_channels: int | None = None,
         activation_cls: type[nn.Module] | None = None,
         p_drop=0,
     ):
         """
-        Uses similar architecture to ConvDownblock but doesn't use stride = 2 to halve image size
+        Uses the same residual + time-conditioning pattern as the encoder/decoder blocks.
         """
         super().__init__()
         self.channels = channels
         self.d_trunk = d_trunk
-        self.d_concat = d_concat
-        act_cls = activation_cls if activation_cls else nn.SiLU
 
-        self.bottleneck = two_conv_block(
-            in_ch=channels + d_concat,
-            mid_ch=channels,
-            out_ch=channels,
-            groups=group_norm_size,
-            act_cls=act_cls,
+        self.res_block = ResnetBlock(
+            channels,
+            channels,
+            group_norm_size=group_norm_size,
+            d_trunk=d_trunk,
+            spatial_cond_channels=spatial_cond_channels,
+            activation_cls=activation_cls,
             p_drop=p_drop,
         )
-        self.emb_mlp = nn.Linear(d_trunk, d_concat, bias=False)
 
-    def forward(self, x: torch.Tensor, trunk_emb: torch.Tensor) -> torch.Tensor:
-        """
-        Project trunk embedding to d_concat, expand spatially, then concat.
-        """
-        emb = self.emb_mlp(trunk_emb)[:, :, None, None]
-        emb = emb.expand(-1, -1, x.size(2), x.size(3))
-        x = torch.cat([x, emb], dim=1)
-        return self.bottleneck(x)
+    def forward(
+        self,
+        x: torch.Tensor,
+        trunk_emb: torch.Tensor | None,
+        spatial_cond: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        return self.res_block(x, trunk_emb, spatial_cond=spatial_cond)
+
+
+class LConditionEncoder(nn.Module):
+    def __init__(
+        self,
+        channels: list[int],
+        group_norm_size=8,
+        activation_cls: type[nn.Module] | None = None,
+        dropout_enc_list=None,
+    ):
+        super().__init__()
+        self.encoder = Encoder(
+            channels,
+            d_trunk=None,
+            group_norm_size=group_norm_size,
+            spatial_cond_channels=None,
+            activation_cls=activation_cls,
+            dropout_enc_list=dropout_enc_list,
+        )
+
+    def forward(self, L: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
+        return self.encoder(L, trunk_emb=None)
+
+    @classmethod
+    def from_config(cls, cfg: UNetConfig) -> "LConditionEncoder":
+        cond_cfg = replace(cfg, in_channels=1)
+        return cls(
+            channels=list(cond_cfg.channels),
+            group_norm_size=cond_cfg.group_norm_size,
+            activation_cls=cond_cfg.activation_cls,
+            dropout_enc_list=cond_cfg.dropout_enc_dec_list,
+        )
 
 
 class UNet(nn.Module):
@@ -395,8 +504,8 @@ class UNet(nn.Module):
         channels,
         out_channels: int | None = None,
         d_trunk=32,
-        d_concat=8,
         group_norm_size=8,
+        spatial_cond_channels: list[int] | None = None,
         d_time=128,
         max_time_period=10000.0,
         activation_cls: type[nn.Module] | None = None,
@@ -409,19 +518,20 @@ class UNet(nn.Module):
         self.channels = list(channels)
         self.d_trunk = d_trunk
         self.conditioning_model = conditioning_model
+        spatial_cond_channels = spatial_cond_channels or None
         self.encoder = Encoder(
             channels,
             d_trunk,
-            d_concat,
             group_norm_size,
+            spatial_cond_channels=spatial_cond_channels,
             activation_cls=activation_cls,
             dropout_enc_list=dropout_enc_dec_list,
         )
         self.decoder = Decoder(
             channels,
             d_trunk,
-            d_concat,
             group_norm_size,
+            spatial_cond_channels=spatial_cond_channels,
             upsample_mode=upsample_mode,
             activation_cls=activation_cls,
             dropout_dec_list=dropout_enc_dec_list[::-1],
@@ -430,8 +540,10 @@ class UNet(nn.Module):
         self.bottleneck = Bottleneck(
             self.channels[-1],
             d_trunk,
-            d_concat,
             group_norm_size,
+            spatial_cond_channels=spatial_cond_channels[-1]
+            if spatial_cond_channels is not None
+            else None,
             activation_cls=activation_cls,
             p_drop=dropout_bottleneck,
         )
@@ -449,7 +561,15 @@ class UNet(nn.Module):
             nn.Linear(d_trunk, d_trunk),
         )
 
-    def forward(self, x, t, cond_emb=None, *args, **kwargs) -> torch.Tensor:
+    def forward(
+        self,
+        x,
+        t,
+        cond_emb=None,
+        spatial_cond: tuple[list[torch.Tensor], torch.Tensor] | None = None,
+        *args,
+        **kwargs,
+    ) -> torch.Tensor:
         time_emb = self.time_embedding_mlp(t)
         if cond_emb is None:
             cond_emb = torch.zeros_like(time_emb)
@@ -457,9 +577,20 @@ class UNet(nn.Module):
             cond_emb = self.conditioning_model(cond_emb)
 
         trunk_emb = self.cond_time_mlp(torch.cat([time_emb, cond_emb], dim=1))
-        x, skip_features = self.encoder(x, trunk_emb)
-        x = self.bottleneck(x, trunk_emb)
-        x = self.decoder(x, trunk_emb, skip_features)
+        spatial_skip_features = None
+        spatial_bottleneck = None
+        if spatial_cond is not None:
+            spatial_skip_features, spatial_bottleneck = spatial_cond
+        x, skip_features = self.encoder(
+            x, trunk_emb, spatial_cond=spatial_skip_features
+        )
+        x = self.bottleneck(x, trunk_emb, spatial_cond=spatial_bottleneck)
+        x = self.decoder(
+            x,
+            trunk_emb,
+            skip_features,
+            spatial_cond=spatial_skip_features,
+        )
         return x
 
     @classmethod
@@ -467,13 +598,14 @@ class UNet(nn.Module):
         cls,
         cfg: UNetConfig,
         conditioning_model: nn.Module | None = None,
+        spatial_cond_channels: list[int] | None = None,
     ) -> "UNet":
         return cls(
             channels=list(cfg.channels),
             out_channels=cfg.out_channels,
             d_trunk=cfg.d_trunk,
-            d_concat=cfg.d_concat,
             group_norm_size=cfg.group_norm_size,
+            spatial_cond_channels=spatial_cond_channels,
             d_time=cfg.d_time,
             max_time_period=cfg.max_time_period,
             activation_cls=cfg.activation_cls,
@@ -508,14 +640,51 @@ class ClassCondUNet(nn.Module):
 
 
 class SimpleColouriser(nn.Module):
-    def __init__(self, core: UNet):
+    def __init__(
+        self,
+        core: UNet,
+    ):
         super().__init__()
         self.core = core
 
     @classmethod
     def from_config(cls, cfg: UNetConfig) -> "SimpleColouriser":
+        if cfg.in_channels != 3:
+            raise ValueError(
+                "SimpleColouriser requires unet_cfg.in_channels=3 (ab + L)"
+            )
         core = UNet.from_config(cfg)
         return cls(core)
 
-    def forward(self, x, t):
+    def forward(self, ab_t, t, L):
+        x = torch.cat([ab_t, L], dim=1)
         return self.core(x, t)
+
+
+class LEncoderColouriser(nn.Module):
+    def __init__(
+        self,
+        core: UNet,
+        l_encoder: LConditionEncoder,
+    ):
+        super().__init__()
+        self.core = core
+        self.l_encoder = l_encoder
+
+    @classmethod
+    def from_config(cls, cfg: UNetConfig) -> "LEncoderColouriser":
+        if cfg.in_channels != 2:
+            raise ValueError(
+                "LEncoderColouriser requires unet_cfg.in_channels=2 (ab only)"
+            )
+        l_cfg = replace(cfg, in_channels=1)
+        l_encoder = LConditionEncoder.from_config(l_cfg)
+        core = UNet.from_config(
+            cfg,
+            spatial_cond_channels=list(l_cfg.channels[1:]),
+        )
+        return cls(core, l_encoder)
+
+    def forward(self, ab_t, t, L):
+        cond_x, cond_skip_features = self.l_encoder(L)
+        return self.core(ab_t, t, spatial_cond=(cond_skip_features, cond_x))

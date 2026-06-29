@@ -15,16 +15,25 @@ ssh -L 5000:localhost:5000 \
 ## Training
 The training entrypoint uses LightningCLI, so run a config directly with `fit`:
 ```shell
-python train.py fit --config configs/train/cifar10_colouriser.yaml
+python train.py fit --config configs/cifar10/cifar10_colouriser.yaml
 ```
 
 To launch a run in `tmux`, start the MLflow Docker Compose stack, and shut the machine down after it completes:
 ```shell
-./run_and_shutdown.sh --config configs/train/cifar10_colouriser.yaml --shutdown
+./run_and_shutdown.sh --config configs/cifar10/cifar10_colouriser.yaml --shutdown
 ```
 
 Useful variations:
 ```shell
-./run_and_shutdown.sh --config configs/train/cifar10_colouriser_debug.yaml
-./run_and_shutdown.sh --config configs/train/mnist_uncond.yaml
+./run_and_shutdown.sh --config configs/cifar10/cifar10_colouriser_cfg.yaml
+./run_and_shutdown.sh --config configs/cifar10/cifar10_colouriser_lencoder.yaml
+./run_and_shutdown.sh --config configs/mnist/mnist_uncond.yaml
+```
+
+## Optuna Sweeps
+For `optuna-lightning-cli`, use the LEncoder tuning config:
+```shell
+optuna-lightning tune \
+  --training-config configs/cifar10/optuna/cifar10_colouriser_lencoder_training.yaml \
+  --optuna-config configs/cifar10/optuna/cifar10_colouriser_lencoder_optuna.yaml
 ```

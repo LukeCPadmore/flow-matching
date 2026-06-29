@@ -9,7 +9,6 @@ model:
       mult: 2.0
       n_layers: 3
       d_trunk: 8
-      d_concat: 8
       group_norm_size: 8
       d_time: 128
       max_time_period: 10000.0
@@ -72,4 +71,7 @@ trainer:
     - class_path: src.flow_matching.models.lightning.MLFlowArtifactCallback
       init_args:
         model_artifact_name: UNet
-        config_path: configs/train/mnist_uncond_debug.yaml
+        config_path: configs/mnist/mnist_uncond_debug.yaml
+    - class_path: src.flow_matching.models.lightning.EMAWeightAveraging
+      init_args:
+        decay: 0.999

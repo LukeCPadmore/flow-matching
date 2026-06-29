@@ -4,49 +4,48 @@ model:
   class_path: src.flow_matching.models.lightning.ClassConditionalFlowMatchingModule
   init_args:
     unet_cfg:
-      in_channels: 1
-      base_channels: 32
+      in_channels: 3
+      base_channels: 64
       mult: 2.0
       n_layers: 3
-      d_trunk: 8
-      d_concat: 8
+      d_trunk: 32
       group_norm_size: 8
       d_time: 128
       max_time_period: 10000.0
       activation_name: silu
       upsample_mode: nearest
     optimizer_name: adamw
-    lr: 0.001
-    weight_decay: 0.01
+    lr: 0.0003
+    weight_decay: 0.0001
     n_classes: 10
     d_cls_emb: 128
     null_id: 10
     p_drop: 0.2
 
 data:
-  class_path: src.flow_matching.utils.data_modules.MNISTDataModule
+  class_path: src.flow_matching.utils.data_modules.CIFAR10DataModule
   init_args:
-    batch_size: 64
+    batch_size: 128
     data_path: data
-    num_workers: 0
+    num_workers: 4
     transform: default
     shuffle: true
 
 trainer:
-  default_root_dir: outputs/mnist_cond
-  max_epochs: 50
-  log_every_n_steps: 20
+  default_root_dir: outputs/cifar10_cond
+  max_epochs: 20
+  log_every_n_steps: 50
   logger:
     class_path: lightning.pytorch.loggers.MLFlowLogger
     init_args:
-      experiment_name: Flow Matching MNIST Conditional
-      run_name: mnist_cond
+      experiment_name: Flow Matching CIFAR10 Conditional
+      run_name: cifar10_cond
       tracking_uri: http://localhost:5000
       save_dir: outputs/mlflow
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: outputs/mnist_cond/checkpoints
+        dirpath: outputs/cifar10_cond/checkpoints
         filename: best
         monitor: val_mse_epoch
         mode: min
@@ -62,13 +61,16 @@ trainer:
         guidance_scale: 1.0
         ode_solver_name: euler_solver
         sample_seed: 42
-        artifact_prefix: samples/mnist_cond
+        artifact_prefix: samples/cifar10_cond
     - class_path: src.flow_matching.models.lightning.InputGridCallback
       init_args:
         n_images: 64
         nrow: 8
-        artifact_prefix: inputs/mnist_cond
+        artifact_prefix: inputs/cifar10_cond
     - class_path: src.flow_matching.models.lightning.MLFlowArtifactCallback
       init_args:
         model_artifact_name: ClassCondUNet
-        config_path: configs/train/mnist_cond.yaml
+        config_path: configs/cifar10/cifar10_cond.yaml
+    - class_path: src.flow_matching.models.lightning.EMAWeightAveraging
+      init_args:
+        decay: 0.999

@@ -1,0 +1,75 @@
+seed_everything: 42
+
+model:
+  class_path: src.flow_matching.models.lightning.SimpleColouriserFlowMatchingModule
+  init_args:
+    unet_cfg:
+      in_channels: 3
+      out_channels: 2
+      base_channels: 64
+      mult: 2.0
+      n_layers: 3
+      d_trunk: 32
+      group_norm_size: 8
+      d_time: 128
+      max_time_period: 10000.0
+      activation_name: silu
+      upsample_mode: nearest
+    optimizer_name: adamw
+    lr: 1e-3
+    weight_decay: 0.0001
+
+data:
+  class_path: src.flow_matching.utils.data_modules.CIFAR10ColouriserDataModule
+  init_args:
+    batch_size: 64
+    data_path: data
+    num_workers: 4
+    shuffle: true
+    drop_labels: true
+    use_weighted_sampler: true
+
+trainer:
+  default_root_dir: outputs/cifar10_colouriser
+  overfit_batches: 1
+  max_epochs: 10
+  log_every_n_steps: 5
+  accelerator: auto
+  logger:
+    class_path: lightning.pytorch.loggers.MLFlowLogger
+    init_args:
+      experiment_name: Flow Matching CIFAR10 Colouriser
+      run_name: cifar10_colouriser_debug_tanh_euler_20_steps
+      tracking_uri: http://localhost:5000
+      save_dir: outputs/mlflow
+  enable_checkpointing: true
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: outputs/cifar10_colouriser/checkpoints
+        filename: best
+        monitor: val_mse_epoch
+        mode: min
+        save_top_k: 1
+        save_last: true
+        auto_insert_metric_name: false
+    - class_path: src.flow_matching.models.lightning.ColouriserLPIPSCallback
+      init_args:
+        every_n_epochs: 5
+        n_images: 64
+        n_steps: 20
+        clamp_mode: tanh
+        ode_solver_name: euler_solver
+        sample_seed: 42
+    - class_path: src.flow_matching.models.lightning.InputGridCallback
+      init_args:
+        n_images: 64
+        nrow: 8
+        artifact_prefix: inputs/cifar10_colouriser_debug
+    - class_path: src.flow_matching.models.lightning.MLFlowArtifactCallback
+      init_args:
+        model_artifact_name: SimpleColouriser
+        config_path: configs/cifar10/cifar10_colouriser_debug.yaml
+    - class_path: src.flow_matching.models.lightning.EMAWeightAveraging
+      init_args:
+        decay: 0.999

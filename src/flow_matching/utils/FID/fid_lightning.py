@@ -8,9 +8,9 @@ import torch
 import torch.nn as nn
 from lightning.pytorch.callbacks import Callback
 
-from src.flow_matching.models.config import make_optimizer
-from src.flow_matching.utils.mlflow_tracking_utils import load_lightning_checkpoint_path_from_run
-from src.flow_matching.utils.train import unpack_batch
+from flow_matching.models.config import make_optimizer
+from flow_matching.utils.mlflow_tracking_utils import load_lightning_checkpoint_path_from_run
+from flow_matching.utils.train import unpack_batch
 
 
 class FIDBackbone(nn.Module):

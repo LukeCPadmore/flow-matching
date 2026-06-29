@@ -14,21 +14,28 @@ import torch.nn as nn
 import torch.nn.functional as F
 from lightning.pytorch.callbacks import Callback
 from lightning.pytorch.callbacks import ModelCheckpoint
+from lightning.pytorch.callbacks import WeightAveraging
 from lightning.pytorch.loggers import MLFlowLogger
+from torch.optim.swa_utils import get_ema_avg_fn
 from torchmetrics.image.lpip import LearnedPerceptualImagePatchSimilarity
 
-from src.flow_matching.models.config import UNetConfig, make_optimizer
-from src.flow_matching.models.ode_solvers import (
+from flow_matching.models.config import UNetConfig, make_optimizer
+from flow_matching.models.ode_solvers import (
     get_ode_solver_from_name,
     sample_colouriser_ab,
     sample_conditional,
     sample_unconditional,
 )
-from src.flow_matching.models.unet import ClassCondUNet, UNet, SimpleColouriser
-from src.flow_matching.utils.FID.fid_evaluation import build_fid_metric
-from src.flow_matching.utils.FID.fid_lightning import FIDClassifierLightningModule
-from src.flow_matching.utils.data_modules import lab_to_rgb
-from src.flow_matching.utils.train import (
+from flow_matching.models.unet import (
+    ClassCondUNet,
+    LEncoderColouriser,
+    SimpleColouriser,
+    UNet,
+)
+from flow_matching.utils.FID.fid_evaluation import build_fid_metric
+from flow_matching.utils.FID.fid_lightning import FIDClassifierLightningModule
+from flow_matching.utils.data_modules import lab_to_rgb
+from flow_matching.utils.train import (
     create_pil_image,
     flow_matching_step,
     flow_matching_step_cfg,
@@ -184,7 +191,9 @@ class RunningABStats:
             self._update_ab_histogram(paired_ab, self.true_ab_hist2d)
             self._update_ab_histogram(ab, self.pred_ab_hist2d)
 
-    def _update_ab_histogram(self, ab: torch.Tensor, hist2d: torch.Tensor | None) -> None:
+    def _update_ab_histogram(
+        self, ab: torch.Tensor, hist2d: torch.Tensor | None
+    ) -> None:
         if hist2d is None:
             return
         ab = ab.detach().to(dtype=torch.float64, device="cpu")
@@ -315,7 +324,12 @@ def _log_colouriser_ab_histogram(
     )
     for outer_cell, hist2d, title in panels:
         block = outer_cell.subgridspec(
-            2, 2, height_ratios=[1.0, 4.0], width_ratios=[4.0, 1.0], hspace=0.05, wspace=0.05
+            2,
+            2,
+            height_ratios=[1.0, 4.0],
+            width_ratios=[4.0, 1.0],
+            hspace=0.05,
+            wspace=0.05,
         )
         ax_top = fig.add_subplot(block[0, 0])
         ax_joint = fig.add_subplot(block[1, 0], sharex=ax_top)
@@ -680,6 +694,7 @@ class SimpleColouriserFlowMatchingModule(BaseFlowMatchingModule):
         optimizer_name: str = "adamw",
         lr: float = 3e-4,
         weight_decay: float = 1e-4,
+        p_drop: float = 0.0,
     ) -> None:
         super().__init__(
             unet_cfg=unet_cfg,
@@ -687,13 +702,18 @@ class SimpleColouriserFlowMatchingModule(BaseFlowMatchingModule):
             lr=lr,
             weight_decay=weight_decay,
         )
+        if not 0.0 <= p_drop < 1.0:
+            raise ValueError(f"p_drop must be in [0, 1), got {p_drop}")
+        self.p_drop = float(p_drop)
         self.save_hyperparameters()
 
     def _build_generator(self) -> nn.Module:
         return SimpleColouriser.from_config(self.unet_cfg)
 
-    def forward(self, LAB_t: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
-        return self.generator(LAB_t, t)
+    def forward(
+        self, ab_t: torch.Tensor, t: torch.Tensor, L: torch.Tensor
+    ) -> torch.Tensor:
+        return self.generator(ab_t, t, L)
 
     def _loss(self, batch) -> torch.Tensor:
         LAB, _ = unpack_batch(batch)
@@ -704,10 +724,22 @@ class SimpleColouriserFlowMatchingModule(BaseFlowMatchingModule):
         x0 = torch.randn_like(ab)
         t = torch.rand(B, 1, 1, 1, device=ab.device, dtype=ab.dtype)
         ab_t = (1 - t) * x0 + t * ab
-        LAB_t = torch.cat([L, ab_t], dim=1)
-        v_est = self.generator(LAB_t, t)
+        if self.p_drop > 0:
+            drop_mask = (
+                torch.rand((B, 1, 1, 1), device=ab.device, dtype=ab.dtype)
+                < self.p_drop
+            )
+            L = torch.where(drop_mask, torch.zeros_like(L), L)
+        v_est = self.generator(ab_t, t, L)
         v_true = ab - x0
         return self.loss_fn(v_est, v_true)
+
+
+class LEncoderColouriserFlowMatchingModule(SimpleColouriserFlowMatchingModule):
+    model_artifact_name = "LEncoderColouriser"
+
+    def _build_generator(self) -> nn.Module:
+        return LEncoderColouriser.from_config(self.unet_cfg)
 
 
 def _get_sampling_metadata(trainer: pl.Trainer) -> tuple[tuple[int, ...], Any, Any]:
@@ -762,6 +794,32 @@ def _log_sample_image(trainer: pl.Trainer, image, artifact_prefix: str) -> None:
             image,
             artifact_file=f"{artifact_prefix}/epoch_{trainer.current_epoch:04d}.png",
         )
+
+
+class EMAWeightAveraging(WeightAveraging):
+    def __init__(
+        self,
+        start_step: int = 100,
+        decay: float = 0.999,
+        device: str | torch.device | int | None = None,
+        use_buffers: bool = False,
+    ) -> None:
+        if start_step < 0:
+            raise ValueError(f"start_step must be >= 0, got {start_step}")
+        if not 0.0 < decay < 1.0:
+            raise ValueError(f"decay must be in (0, 1), got {decay}")
+        self.start_step = int(start_step)
+        self.decay = float(decay)
+        super().__init__(
+            device=device,
+            use_buffers=use_buffers,
+            avg_fn=get_ema_avg_fn(decay=self.decay),
+        )
+
+    def should_update(
+        self, step_idx: int | None = None, epoch_idx: int | None = None
+    ) -> bool:
+        return step_idx is not None and step_idx >= self.start_step
 
 
 class UnconditionalSampleCallback(Callback):
@@ -897,6 +955,7 @@ class ColouriserLPIPSCallback(Callback):
         n_images: int = 64,
         nrow: int = 8,
         n_steps: int = 50,
+        guidance_scale: float = 1.0,
         ode_solver_name: str = "euler_solver",
         clamp_mode: str = "clamp",
         sample_seed: int | None = 0,
@@ -905,6 +964,7 @@ class ColouriserLPIPSCallback(Callback):
         self.n_images = int(n_images)
         self.nrow = int(nrow)
         self.n_steps = int(n_steps)
+        self.guidance_scale = float(guidance_scale)
         self.ode_solver_name = ode_solver_name
         self.sample_seed = sample_seed
         self.clamp_mode = clamp_mode
@@ -971,6 +1031,7 @@ class ColouriserLPIPSCallback(Callback):
                     pl_module.generator,
                     L,
                     n_steps=self.n_steps,
+                    guidance_scale=self.guidance_scale,
                     ode_solver=ode_solver,
                     seed=self.sample_seed,
                     device=pl_module.device,

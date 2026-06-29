@@ -1,0 +1,75 @@
+seed_everything: 101
+
+model:
+  class_path: src.flow_matching.models.lightning.LEncoderColouriserFlowMatchingModule
+  init_args:
+    unet_cfg:
+      in_channels: 2
+      out_channels: 2
+      base_channels: 32
+      mult: 2.0
+      n_layers: 4
+      d_trunk: 32
+      group_norm_size: 8
+      d_time: 128
+      max_time_period: 10000.0
+      activation_name: silu
+      upsample_mode: nearest
+    optimizer_name: adamw
+    p_drop: 0.1
+    lr: 1e-4
+    weight_decay: 1e-4
+
+data:
+  class_path: src.flow_matching.utils.data_modules.OxfordPetsColouriserDataModule
+  init_args:
+    batch_size: 32
+    data_path: data
+    num_workers: 4
+    transform: LAB
+    shuffle: true
+    drop_labels: true
+    use_weighted_sampler: true
+
+trainer:
+  default_root_dir: outputs/oxford_pets_colouriser_lencoder
+  max_epochs: 100
+  check_val_every_n_epoch: 10
+  log_every_n_steps: 20
+  accelerator: auto
+  precision: bf16-mixed
+  logger:
+    class_path: lightning.pytorch.loggers.MLFlowLogger
+    init_args:
+      experiment_name: Flow Matching Oxford-IIIT Pets Colouriser
+      run_name: oxford_pets_colouriser_lencoder_cfg_colour_weighting
+      tracking_uri: http://localhost:5000
+      save_dir: outputs/mlflow
+      log_model: true
+  callbacks:
+    - class_path: lightning.pytorch.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: outputs/oxford_pets_colouriser_lencoder/checkpoints
+        filename: best
+        monitor: val_lpips
+        mode: min
+        save_top_k: 1
+        save_last: true
+        auto_insert_metric_name: false
+    - class_path: src.flow_matching.models.lightning.ColouriserLPIPSCallback
+      init_args:
+        every_n_epochs: 10
+        n_images: 32
+        n_steps: 25
+        ode_solver_name: euler_solver
+        clamp_mode: tanh
+        guidance_scale: 1.5
+        sample_seed: 101
+    - class_path: src.flow_matching.models.lightning.MLFlowArtifactCallback
+      init_args:
+        model_artifact_name: LEncoderColouriser
+        config_path: configs/oxford_pets/oxford_pets_colouriser_lencoder.yaml
+        best_score_metric_name: best_lpips
+    - class_path: src.flow_matching.models.lightning.EMAWeightAveraging
+      init_args:
+        decay: 0.999

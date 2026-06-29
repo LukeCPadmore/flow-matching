@@ -8,6 +8,7 @@ optuna.db
 mlartifacts/*
 checkpoints/*
 outputs/
+lightning_logs/*
 
 
 # Python cache files
@@ -20,3 +21,4 @@ __pycache__/
 .eggs/
 build/
 dist/
+

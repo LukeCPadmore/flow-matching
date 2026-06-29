@@ -6,7 +6,7 @@ from torchmetrics.image.fid import FrechetInceptionDistance
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from src.flow_matching.utils.FID.fid_lightning import FIDClassifierLightningModule
+from flow_matching.utils.FID.fid_lightning import FIDClassifierLightningModule
 
 
 def build_fid_metric(backbone: torch.nn.Module) -> FrechetInceptionDistance:

@@ -1,4 +1,4 @@
-seed_everything: 101
+seed_everything: 22
 
 model:
   class_path: src.flow_matching.models.lightning.SimpleColouriserFlowMatchingModule
@@ -10,7 +10,6 @@ model:
       mult: 2.0
       n_layers: 3
       d_trunk: 32
-      d_concat: 8
       group_norm_size: 8
       d_time: 128
       max_time_period: 10000.0
@@ -19,6 +18,7 @@ model:
     optimizer_name: adamw
     lr: 0.0003
     weight_decay: 0.0001
+    p_drop: 0.1
 
 data:
   class_path: src.flow_matching.utils.data_modules.CIFAR10ColouriserDataModule
@@ -28,22 +28,23 @@ data:
     num_workers: 4
     shuffle: true
     drop_labels: true
+    use_weighted_sampler: true
 
 trainer:
-  default_root_dir: outputs/cifar10_colouriser
+  default_root_dir: outputs/cifar10_colouriser_cfg
   max_epochs: 50
   log_every_n_steps: 50
   logger:
     class_path: lightning.pytorch.loggers.MLFlowLogger
     init_args:
-      experiment_name: Flow Matching CIFAR10 Colouriser
-      run_name: cifar10_colouriser
+      experiment_name: CIFAR10 Cond Ablation
+      run_name: cifar10_colouriser_cfg
       tracking_uri: http://localhost:5000
       save_dir: outputs/mlflow
   callbacks:
     - class_path: lightning.pytorch.callbacks.ModelCheckpoint
       init_args:
-        dirpath: outputs/cifar10_colouriser/checkpoints
+        dirpath: outputs/cifar10_colouriser_cfg/checkpoints
         filename: best
         monitor: val_lpips
         mode: min
@@ -54,11 +55,15 @@ trainer:
       init_args:
         every_n_epochs: 5
         n_images: 64
-        n_steps: 50
+        n_steps: 20
+        guidance_scale: 1.5
         ode_solver_name: euler_solver
-        sample_seed: 42
+        sample_seed: 22
     - class_path: src.flow_matching.models.lightning.MLFlowArtifactCallback
       init_args:
         model_artifact_name: SimpleColouriser
-        config_path: configs/train/cifar10_colouriser.yaml
+        config_path: configs/cifar10/cifar10_colouriser_cfg.yaml
         best_score_metric_name: best_lpips
+    - class_path: src.flow_matching.models.lightning.EMAWeightAveraging
+      init_args:
+        decay: 0.999

@@ -1,0 +1,55 @@
+seed_everything: 22
+
+model:
+  class_path: src.flow_matching.models.lightning.LEncoderColouriserFlowMatchingModule
+  init_args:
+    unet_cfg:
+      in_channels: 2
+      out_channels: 2
+      base_channels: 64
+      mult: 2.0
+      n_layers: 3
+      d_trunk: 32
+      group_norm_size: 8
+      d_time: 128
+      max_time_period: 10000.0
+      activation_name: silu
+      upsample_mode: nearest
+    optimizer_name: adamw
+    lr: 0.0003
+    weight_decay: 0.0001
+    p_drop: 0.0
+
+data:
+  class_path: src.flow_matching.utils.data_modules.CIFAR10ColouriserDataModule
+  init_args:
+    batch_size: 256
+    data_path: data
+    num_workers: 0
+    shuffle: true
+    drop_labels: true
+    use_weighted_sampler: true
+
+trainer:
+  default_root_dir: outputs/cifar10_cond_ablation/lencoder
+  max_epochs: 10
+  log_every_n_steps: 50
+  logger:
+    class_path: lightning.pytorch.loggers.MLFlowLogger
+    init_args:
+      experiment_name: CIFAR10 Cond Ablation
+      run_name: cifar10_cond_ablation_lencoder
+      tracking_uri: http://localhost:5000
+      save_dir: outputs/mlflow
+  callbacks:
+    - class_path: src.flow_matching.models.lightning.ColouriserLPIPSCallback
+      init_args:
+        every_n_epochs: 5
+        n_images: 64
+        n_steps: 20
+        guidance_scale: 1.0
+        ode_solver_name: euler_solver
+        sample_seed: 22
+    - class_path: src.flow_matching.models.lightning.EMAWeightAveraging
+      init_args:
+        decay: 0.999

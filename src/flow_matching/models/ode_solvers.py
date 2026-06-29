@@ -3,59 +3,106 @@ from typing import Callable
 
 
 @torch.no_grad()
-def euler_solver(f: Callable, x0, t0: float, t1: float, n_steps: int):
+def euler_solver(
+    f: Callable,
+    x0,
+    t0: float,
+    t1: float,
+    n_steps: int,
+    return_all: bool = True,
+):
     """Simple Euler integrator."""
     # Split [0,1] into n_steps intervals
     h = (t1 - t0) / n_steps
     x = x0.clone()
-    xs, ts = [], []
-    for k in range(n_steps + 1):
+    if return_all:
+        xs, ts = [], []
+        for k in range(n_steps + 1):
+            t = t0 + k * h
+            ts.append(t)
+            xs.append(x.clone())
+            if k < n_steps:
+                dx = f(x, t)
+                x = x + h * dx
+        return xs, ts
+
+    for k in range(n_steps):
         t = t0 + k * h
-        ts.append(t)
-        xs.append(x.clone())
-        if k < n_steps:
-            dx = f(x, t)
-            x = x + h * dx
-    return xs, ts
+        dx = f(x, t)
+        x = x + h * dx
+    return x, None
 
 
 @torch.no_grad()
-def rk2_solver(f:Callable, x0: torch.Tensor, t0: float, t1: float, n_steps: int):
+def rk2_solver(
+    f: Callable,
+    x0: torch.Tensor,
+    t0: float,
+    t1: float,
+    n_steps: int,
+    return_all: bool = True,
+):
     """RK2 integrator."""
     # Split [0,1] into n_steps intervals
     h = (t1 - t0) / n_steps
     x = x0.clone()
-    xs, ts = [], []
-    for k in range(n_steps + 1):
+    if return_all:
+        xs, ts = [], []
+        for k in range(n_steps + 1):
+            t = t0 + k * h
+            ts.append(t)
+            xs.append(x.clone())
+            if k < n_steps:
+                k1 = f(x, t)
+                x_pred = x + h * k1
+                k2 = f(x_pred, t + h)
+                x = x + 0.5 * h * (k1 + k2)
+        return xs, ts
+
+    for k in range(n_steps):
         t = t0 + k * h
-        ts.append(t)
-        xs.append(x.clone())
-        if k < n_steps:
-            k1 = f(x, t)
-            x_pred = x + h * k1
-            k2 = f(x_pred, t + h)
-            x = x + 0.5 * h * (k1 + k2)
-    return xs, ts
+        k1 = f(x, t)
+        x_pred = x + h * k1
+        k2 = f(x_pred, t + h)
+        x = x + 0.5 * h * (k1 + k2)
+    return x, None
 
 
 @torch.no_grad()
-def rk4_solver(f, x0, t0: float, t1: float, n_steps: int):
+def rk4_solver(
+    f,
+    x0,
+    t0: float,
+    t1: float,
+    n_steps: int,
+    return_all: bool = True,
+):
     """Classical RK4 integrator."""
     assert n_steps >= 1, "n_steps must be >= 1"
     h = (t1 - t0) / n_steps
     x = x0.clone()
-    xs, ts = [], []
-    for k in range(n_steps + 1):
+    if return_all:
+        xs, ts = [], []
+        for k in range(n_steps + 1):
+            t = t0 + k * h
+            ts.append(t)
+            xs.append(x.clone())
+            if k < n_steps:
+                k1 = f(x, t)
+                k2 = f(x + 0.5 * h * k1, t + 0.5 * h)
+                k3 = f(x + 0.5 * h * k2, t + 0.5 * h)
+                k4 = f(x + h * k3, t + h)
+                x = x + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+        return xs, ts
+
+    for k in range(n_steps):
         t = t0 + k * h
-        ts.append(t)
-        xs.append(x.clone())
-        if k < n_steps:
-            k1 = f(x, t)
-            k2 = f(x + 0.5 * h * k1, t + 0.5 * h)
-            k3 = f(x + 0.5 * h * k2, t + 0.5 * h)
-            k4 = f(x + h * k3, t + h)
-            x = x + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
-    return xs, ts
+        k1 = f(x, t)
+        k2 = f(x + 0.5 * h * k1, t + 0.5 * h)
+        k3 = f(x + 0.5 * h * k2, t + 0.5 * h)
+        k4 = f(x + h * k3, t + h)
+        x = x + (h / 6.0) * (k1 + 2 * k2 + 2 * k3 + k4)
+    return x, None
 
 
 def make_vf(
@@ -131,17 +178,25 @@ def create_samples(
         g = torch.Generator(device=device).manual_seed(seed)
 
     x0 = torch.randn((n_images, *image_shape), device=device, generator=g)
-    xs, _ = ode_solver(f, x0, 0.0, 1.0, n_steps)
+    xs, _ = ode_solver(f, x0, 0.0, 1.0, n_steps, return_all=return_all)
 
-    # Apply clamping/squashing to each step
+    if return_all:
+        if clamp_mode == "clamp":
+            xs = [x.clamp_(*clamp_range) for x in xs]
+        elif clamp_mode == "tanh":
+            xs = [torch.tanh(x) for x in xs]
+        elif clamp_mode is not None:
+            raise ValueError(f"Unknown clamp_mode: {clamp_mode}")
+        return xs
+
+    x = xs
     if clamp_mode == "clamp":
-        xs = [x.clamp_(*clamp_range) for x in xs]
+        x = x.clamp_(*clamp_range)
     elif clamp_mode == "tanh":
-        xs = [torch.tanh(x) for x in xs]
+        x = torch.tanh(x)
     elif clamp_mode is not None:
         raise ValueError(f"Unknown clamp_mode: {clamp_mode}")
-
-    return xs if return_all else xs[-1]
+    return x
 
 
 def sample_unconditional(
@@ -204,6 +259,7 @@ def sample_colouriser_ab(
     *,
     ode_solver,
     n_steps: int,
+    guidance_scale: float = 1.0,
     return_all: bool = False,
     device=None,
     seed: int | None = None,
@@ -212,6 +268,9 @@ def sample_colouriser_ab(
 ):
     if L.ndim != 4 or L.shape[1] != 1:
         raise ValueError(f"Expected L to have shape [B, 1, H, W], got {tuple(L.shape)}")
+
+    was_training = model.training
+    model.eval()
 
     device = L.device if device is None else device
     L = L.to(device)
@@ -230,18 +289,38 @@ def sample_colouriser_ab(
 
     def f(ab, t_scalar: float):
         t = torch.full((batch_size, 1, 1, 1), t_scalar, device=device, dtype=L.dtype)
-        return model(torch.cat([L, ab], dim=1), t)
+        if guidance_scale == 1.0:
+            return model(ab, t, L)
 
-    xs, _ = ode_solver(f, ab0, 0.0, 1.0, n_steps)
+        ab2 = torch.cat([ab, ab], dim=0)
+        t2 = torch.cat([t, t], dim=0)
+        L2 = torch.cat([L, torch.zeros_like(L)], dim=0)
+        v2 = model(ab2, t2, L2)
+        v_cond, v_uncond = v2[:batch_size], v2[batch_size:]
+        return v_uncond + guidance_scale * (v_cond - v_uncond)
 
+    xs, _ = ode_solver(f, ab0, 0.0, 1.0, n_steps, return_all=return_all)
+
+    if was_training:
+        model.train()
+
+    if return_all:
+        if clamp_mode == "clamp":
+            xs = [x.clamp_(*clamp_range) for x in xs]
+        elif clamp_mode == "tanh":
+            xs = [torch.tanh(x) for x in xs]
+        elif clamp_mode is not None:
+            raise ValueError(f"Unknown clamp_mode: {clamp_mode}")
+        return xs
+
+    x = xs
     if clamp_mode == "clamp":
-        xs = [x.clamp_(*clamp_range) for x in xs]
+        x = x.clamp_(*clamp_range)
     elif clamp_mode == "tanh":
-        xs = [torch.tanh(x) for x in xs]
+        x = torch.tanh(x)
     elif clamp_mode is not None:
         raise ValueError(f"Unknown clamp_mode: {clamp_mode}")
-
-    return xs if return_all else xs[-1]
+    return x
 
 
 ODE_SOLVERS: dict[str, Callable] = {

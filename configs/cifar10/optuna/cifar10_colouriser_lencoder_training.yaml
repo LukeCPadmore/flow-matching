@@ -1,0 +1,55 @@
+trainer:
+  default_root_dir: outputs/cifar10_colouriser_lencoder_optuna
+  max_epochs: 10
+  log_every_n_steps: 50
+  accelerator: auto
+  devices: 1
+  logger:
+    class_path: lightning.pytorch.loggers.MLFlowLogger
+    init_args:
+      experiment_name: CIFAR10 Colouriser Optuna
+      run_name: cifar10_colouriser_lencoder
+      tracking_uri: http://localhost:5000
+      save_dir: outputs/mlflow
+  enable_checkpointing: false
+  enable_progress_bar: false
+  callbacks:
+    - class_path: flow_matching.models.lightning.ColouriserLPIPSCallback
+      init_args:
+        every_n_epochs: 5
+        n_images: 64
+        n_steps: 20
+        ode_solver_name: euler_solver
+        sample_seed: 22
+    - class_path: flow_matching.models.lightning.EMAWeightAveraging
+      init_args:
+        decay: 0.999
+
+model:
+  class_path: flow_matching.models.lightning.LEncoderColouriserFlowMatchingModule
+  init_args:
+    unet_cfg:
+      in_channels: 2
+      out_channels: 2
+      base_channels: 64
+      mult: 2.0
+      n_layers: 3
+      d_trunk: 32
+      group_norm_size: 8
+      d_time: 128
+      max_time_period: 10000.0
+      activation_name: silu
+      upsample_mode: nearest
+    optimizer_name: adamw
+    lr: 0.0003
+    weight_decay: 0.0001
+
+data:
+  class_path: flow_matching.utils.data_modules.CIFAR10ColouriserDataModule
+  init_args:
+    batch_size: 32
+    data_path: data
+    num_workers: 0
+    shuffle: true
+    drop_labels: true
+    use_weighted_sampler: true
