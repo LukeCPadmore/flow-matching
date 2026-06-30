@@ -1,5 +1,5 @@
 study:
-  study_name: cifar10_colouriser_lencoder_lr_pow2_optuna
+  study_name: cifar10_colouriser_lencoder_unet_cfg
   direction: minimize
   storage: postgresql+psycopg2://mluser:mlpass@localhost:5432/optuna
   load_if_exists: true
@@ -14,20 +14,28 @@ objective:
   enable_pruning: true
 
 output:
-  best_config_path: outputs/cifar10_colouriser_lencoder_lr_pow2_optuna_best.yaml
+  best_config_path: outputs/cifar10_colouriser_lencoder_unet_cfg.yaml
 
-n_trials: 10
+n_trials: 100
 
 search_space:
   model:
     init_args:
-      lr:
-        type: float
-        low: 0.00001
-        high: 0.001
-        log: true
-  data:
-    init_args:
-      batch_size:
+      unet_cfg.n_layers:
         type: categorical
-        choices: [16, 32, 64, 128, 256]
+        choices: [2,3,4,5]
+      unet_cfg.base_channels: 
+        type: categorical
+        choices: [16,32,64]
+      unet_cfg.d_time: 
+        type: categorical
+        choices: [32,64,128,256]
+      unet_cfg.d_trunk: 
+        type: categorical
+        choices: [16,32,64,128]
+      unet_cfg.activation_name:
+        type: categorical
+        choices: ["relu","silu","gelu"]
+      unet_cfg.upsample_mode:
+        type: categorical
+        choices: ["nearest","bilinear","convtranspose"]

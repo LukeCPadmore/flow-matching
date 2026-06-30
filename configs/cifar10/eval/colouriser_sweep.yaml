@@ -1,0 +1,63 @@
+seed_everything: 22
+
+model:
+  class_path: flow_matching.models.lightning.LEncoderColouriserFlowMatchingModule
+  init_args:
+    unet_cfg:
+      in_channels: 2
+      out_channels: 2
+      base_channels: 64
+      mult: 2.0
+      n_layers: 3
+      d_trunk: 32
+      group_norm_size: 8
+      d_time: 128
+      max_time_period: 10000.0
+      activation_name: silu
+      upsample_mode: nearest
+    optimizer_name: adamw
+    lr: 0.0003
+    weight_decay: 0.0001
+    p_drop: 0.1
+
+data:
+  class_path: flow_matching.utils.data_modules.CIFAR10ColouriserDataModule
+  init_args:
+    batch_size: 64
+    data_path: data
+    num_workers: 4
+    shuffle: false
+    drop_labels: true
+    use_weighted_sampler: false
+
+trainer:
+  default_root_dir: outputs/cifar10_colouriser_sweep
+  accelerator: auto
+  devices: 1
+  logger:
+    class_path: lightning.pytorch.loggers.MLFlowLogger
+    init_args:
+      experiment_name: CIFAR10 Colouriser Sweep
+      run_name: cifar10_colouriser_lencoder_cfg_sweep
+      tracking_uri: http://localhost:5000
+      save_dir: outputs/mlflow
+  enable_checkpointing: false
+  callbacks:
+    - class_path: flow_matching.models.lightning.ColouriserSamplingSweepCallback
+      init_args:
+        ode_solver_names:
+          - euler_solver
+          - rk4_solver
+        n_steps_list:
+          - 10
+          - 20
+          - 50
+        guidance_scales:
+          - 1.0
+          - 1.5
+          - 2.0
+        n_eval_images: 64
+        n_grid_images: 8
+        clamp_mode: clamp
+        sample_seed: 22
+        artifact_prefix: colouriser/sweep

@@ -7,7 +7,7 @@ trainer:
   logger:
     class_path: lightning.pytorch.loggers.MLFlowLogger
     init_args:
-      experiment_name: CIFAR10 Colouriser Optuna
+      experiment_name: CIFAR10 Colouriser Optuna LR + Batch Size
       run_name: cifar10_colouriser_lencoder
       tracking_uri: http://localhost:5000
       save_dir: outputs/mlflow
@@ -41,15 +41,15 @@ model:
       activation_name: silu
       upsample_mode: nearest
     optimizer_name: adamw
-    lr: 0.0003
+    lr: 0.001
     weight_decay: 0.0001
 
 data:
   class_path: flow_matching.utils.data_modules.CIFAR10ColouriserDataModule
   init_args:
-    batch_size: 32
+    batch_size: 16
     data_path: data
-    num_workers: 0
+    num_workers: 3
     shuffle: true
     drop_labels: true
     use_weighted_sampler: true
